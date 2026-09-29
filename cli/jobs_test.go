@@ -380,3 +380,62 @@ func TestJobsRetryAllReachesPastHeldKeysAtTheHead(t *testing.T) {
 		t.Fatalf("failed after retry --all: %d jobs, want only the two skipped ones", len(left))
 	}
 }
+
+type boundedRetryReadQueue struct {
+	*jobs.MemoryQueue
+	maxLimit int
+	reads    int
+}
+
+func (q *boundedRetryReadQueue) Failed(ctx context.Context, queue string, limit int) ([]jobs.FailedJob, error) {
+	q.reads++
+	if limit > q.maxLimit {
+		q.maxLimit = limit
+	}
+	return q.MemoryQueue.Failed(ctx, queue, limit)
+}
+
+func TestJobsRetryAllKeepsOrdinaryReadsBounded(t *testing.T) {
+	base := jobs.NewMemoryQueue()
+	ctx := context.Background()
+	at := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	const backlog = 200
+	for i := 0; i < backlog; i++ {
+		id := fmt.Sprintf("failed-%03d", i)
+		env := jobs.Envelope{ID: id, Name: "send_welcome_email", Version: 1, Payload: json.RawMessage(`{}`)}
+		if err := base.Push(ctx, "mail", env, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		d, err := base.Reserve(ctx, []string{"mail"}, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := base.Bury(ctx, d, jobs.Failure{Reason: jobs.ReasonPermanent, Kind: jobs.KindHandler, Error: "outage", At: at.Add(time.Duration(i) * time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	q := &boundedRetryReadQueue{MemoryQueue: base}
+	cfg := config.Default()
+	cfg.Jobs.Driver, cfg.Jobs.Queue = config.JobsDriverRedis, "mail"
+	prevCfg, prevOpen, prevPage := LoadConfig, openJobsQueue, retryAllPage
+	t.Cleanup(func() { LoadConfig, openJobsQueue, retryAllPage = prevCfg, prevOpen, prevPage })
+	LoadConfig = func() (config.Config, error) { return cfg, nil }
+	openJobsQueue = func(config.Config) (jobs.Queue, func() error, error) { return q, func() error { return nil }, nil }
+	retryAllPage = 10
+
+	out, err := runJobs(t, "retry", "--all")
+	if err != nil {
+		t.Fatalf("retry --all = %v:\n%s", err, out)
+	}
+	if got := strings.Count(out, "Retrying "); got != backlog {
+		t.Fatalf("retry --all retried %d jobs, want %d", got, backlog)
+	}
+	if q.maxLimit != retryAllPage {
+		t.Fatalf("largest Failed limit = %d, want bounded page size %d", q.maxLimit, retryAllPage)
+	}
+	if q.reads <= 1 {
+		t.Fatalf("Failed reads = %d, want paged recovery", q.reads)
+	}
+}
+
