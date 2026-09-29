@@ -168,9 +168,9 @@ func (w *Worker) Run(ctx context.Context) error {
 			return w.shutdown(&inFlight, cancelJobs)
 		}
 		if errors.Is(err, errSetAside) || errors.Is(err, errNotSetAside) {
-			// An undecodable job was buried (or could not be, and stays leased
-			// until it expires, so it is not reserved again meanwhile): look
-			// again at once.
+			// A delivery that cannot be run was buried (or could not be, and
+			// stays leased until it expires, so it is not reserved again
+			// meanwhile): look again at once.
 			<-slots
 			continue
 		}
@@ -202,8 +202,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 }
 
-// reserve takes the next job. An envelope that no longer decodes cannot be
-// run by any worker; it is set aside with the failed jobs and logged.
+// reserve takes the next job. It sets aside deliveries that cannot be run:
+// undecodable envelopes, and expired-lease redeliveries whose next attempt
+// would exceed MaxAttempts.
 func (w *Worker) reserve(ctx context.Context) (Delivery, error) {
 	opCtx, cancel := context.WithTimeout(ctx, queueOpTimeout)
 	defer cancel()
@@ -234,6 +235,9 @@ func (w *Worker) reserve(ctx context.Context) (Delivery, error) {
 			zap.Duration("waited", waited),
 			zap.String("kind", string(KindHandler)),
 			zap.Error(exhaustErr),
+		}
+		if len(d.Envelope.Metadata) > 0 {
+			fields = append(fields, zap.Any("metadata", d.Envelope.Metadata))
 		}
 		buryErr := w.giveUp(d, exhaustErr, policy, fields)
 		w.metrics.record(w.jobLabel(d.Envelope.Name), d.Queue, settled(ResultFailed, buryErr), 0, waited)

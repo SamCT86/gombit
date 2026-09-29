@@ -28,8 +28,10 @@ type Queue interface {
 	// has one, in order. Within a queue the job that became available first
 	// goes first: a waiting job since its available-at time, a job whose
 	// lease expired since that deadline, push order breaking ties. The
-	// returned Delivery's Envelope.Attempt counts this delivery. It does not
-	// block: with nothing available it returns ErrNoJob.
+	// returned Delivery's Envelope.Attempt counts this delivery. Delivery.LeaseExpired
+	// must be true when Reserve reclaims a previous delivery whose lease expired,
+	// and false for pending jobs and jobs returned by Release or Postpone. It does
+	// not block: with nothing available it returns ErrNoJob.
 	//
 	// A stored envelope that no longer decodes is still a delivery: leased,
 	// with a nil error and the failure in Delivery.Err. The caller must end
