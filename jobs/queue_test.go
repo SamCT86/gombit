@@ -122,6 +122,41 @@ func runQueueConformance(t *testing.T, newQueue queueFactory) {
 		expectEmpty(t, q, "default")
 	})
 
+	t.Run("release and postpone are not expired-lease reclaims", func(t *testing.T) {
+		clock := newFakeClock()
+		q := newQueue(t, clock)
+
+		if err := q.Push(ctx, "default", envelope("postponed"), time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		d := mustReserve(t, q, "default")
+		if err := q.Postpone(ctx, d, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		d = mustReserve(t, q, "default")
+		if d.LeaseExpired {
+			t.Fatal("Postpone redelivery was reported as reclaiming an expired lease")
+		}
+		if err := q.Ack(ctx, d); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := q.Push(ctx, "default", envelope("released"), time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		d = mustReserve(t, q, "default")
+		if err := q.Release(ctx, d, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		d = mustReserve(t, q, "default")
+		if d.LeaseExpired {
+			t.Fatal("Release redelivery was reported as reclaiming an expired lease")
+		}
+		if err := q.Ack(ctx, d); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("delayed jobs wait for their time", func(t *testing.T) {
 		clock := newFakeClock()
 		q := newQueue(t, clock)
