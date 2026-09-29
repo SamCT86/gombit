@@ -192,12 +192,12 @@ func newJobsRetryCommand(stdout io.Writer) *cobra.Command {
 				// never one read. Only an empty read is the end: a job that
 				// failed while a page was read or retried can be missing from
 				// a short one, and the next read from the top finds it.
-				total, skipped := 0, map[string]bool{}
+				total, processed, skipped := 0, map[string]bool{}, map[string]bool{}
 				for {
-					// Jobs refused for a held key stay failed wherever they are in
-					// the set, so each read asks for a page beyond the ones already
-					// skipped.
-					limit := retryAllPage + len(skipped)
+					// Jobs already handled by this invocation may still be failed
+					// (a held uniqueness key, or a live worker failed a retried job
+					// again). Ask far enough past all of them to reach older jobs.
+					limit := retryAllPage + len(processed)
 					page, err := q.Failed(ctx, queue, limit)
 					if err != nil {
 						return err
@@ -205,9 +205,10 @@ func newJobsRetryCommand(stdout io.Writer) *cobra.Command {
 					progress := false
 					for _, f := range page {
 						id := f.Envelope.ID
-						if skipped[id] {
+						if processed[id] {
 							continue
 						}
+						processed[id] = true
 						progress = true
 						err := retry(id)
 						var dup *jobs.DuplicateError
@@ -223,7 +224,7 @@ func newJobsRetryCommand(stdout io.Writer) *cobra.Command {
 						}
 						total++
 					}
-					// Only a read with nothing new to retry is the end (an empty
+					// Only a read with nothing new to process is the end (an empty
 					// one included): a short page is not, since a job that failed
 					// meanwhile can be missing from it.
 					if !progress {
