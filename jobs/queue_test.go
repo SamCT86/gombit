@@ -285,13 +285,16 @@ func runQueueConformance(t *testing.T, newQueue queueFactory) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if first.LeaseExpired {
+			t.Fatal("first delivery was reported as reclaiming an expired lease")
+		}
 		clock.Advance(29 * time.Second)
 		expectEmpty(t, q, "default")
 		clock.Advance(time.Second) // the first worker died
 
 		second := mustReserve(t, q, "default")
-		if second.Envelope.ID != "l1" || second.Envelope.Attempt != 2 || second.Receipt == first.Receipt {
-			t.Fatalf("redelivery = %+v, want l1 at attempt 2 under a new receipt", second)
+		if second.Envelope.ID != "l1" || second.Envelope.Attempt != 2 || second.Receipt == first.Receipt || !second.LeaseExpired {
+			t.Fatalf("redelivery = %+v, want l1 at attempt 2 under a new receipt from an expired lease", second)
 		}
 		if err := q.Ack(ctx, first); !errors.Is(err, jobs.ErrLeaseLost) {
 			t.Fatalf("Ack(stale) error = %v, want ErrLeaseLost", err)

@@ -84,6 +84,10 @@ type Delivery struct {
 	// Receipt identifies this lease. Ack and Release with a receipt whose
 	// job was since reserved again fail with ErrLeaseLost.
 	Receipt string
+	// LeaseExpired reports that this delivery reclaimed a previous worker's
+	// expired lease. It is false for normal pending jobs and jobs explicitly
+	// released by a worker, including shutdown interruption.
+	LeaseExpired bool
 	// AvailableAt is when the job became available to this delivery: its
 	// available-at time, or the deadline of the lease that expired. Now minus
 	// AvailableAt is how long it waited in the queue.

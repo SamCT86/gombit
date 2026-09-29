@@ -797,8 +797,8 @@ func TestAnInterruptedLastAttemptIsNotGivenUp(t *testing.T) {
 				t.Fatal(err)
 			}
 			d, err := q.Reserve(context.Background(), []string{"default"}, time.Minute)
-			if err != nil || d.Envelope.Attempt != 2 {
-				t.Fatalf("after shutdown: %+v, %v; want the job back, as attempt 2", d, err)
+			if err != nil || d.Envelope.Attempt != 2 || d.LeaseExpired {
+				t.Fatalf("after shutdown: %+v, %v; want an explicitly released attempt 2, not an expired-lease reclaim", d, err)
 			}
 		})
 	}
