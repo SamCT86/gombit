@@ -219,14 +219,14 @@ func (q *refailingRetryQueue) RetryFailed(ctx context.Context, queue, id string)
 	if !q.refail[id] {
 		return nil
 	}
-	d, err := q.MemoryQueue.Reserve(ctx, []string{queue}, time.Minute)
+	d, err := q.Reserve(ctx, []string{queue}, time.Minute)
 	if err != nil {
 		return err
 	}
 	if d.Envelope.ID != id {
 		return fmt.Errorf("reserved %s after retrying %s", d.Envelope.ID, id)
 	}
-	return q.MemoryQueue.Bury(ctx, d, jobs.Failure{
+	return q.Bury(ctx, d, jobs.Failure{
 		Reason: jobs.ReasonPermanent,
 		Kind:   jobs.KindHandler,
 		Error:  "still broken",
