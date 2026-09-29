@@ -270,7 +270,7 @@ func TestJobsRetryAllRetriesEachListedJobOnce(t *testing.T) {
 	rootCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	stdout, stderr := new(bytes.Buffer), new(bytes.Buffer)
-	err = ExecuteRoot(rootCtx, NewRoot(stdout, stderr), []string{"jobs", "retry", "--all"})
+	err := ExecuteRoot(rootCtx, NewRoot(stdout, stderr), []string{"jobs", "retry", "--all"})
 	out := stdout.String() + stderr.String()
 	if err != nil {
 		t.Fatalf("retry --all = %v:\n%s", err, out)
