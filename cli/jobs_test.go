@@ -195,6 +195,84 @@ func TestJobsRetryAllReadsUntilEmpty(t *testing.T) {
 	}
 }
 
+type refailingRetryQueue struct {
+	*jobs.MemoryQueue
+	retries map[string]int
+}
+
+func (q *refailingRetryQueue) Failed(ctx context.Context, queue string, limit int) ([]jobs.FailedJob, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return q.MemoryQueue.Failed(ctx, queue, limit)
+}
+
+func (q *refailingRetryQueue) RetryFailed(ctx context.Context, queue, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := q.MemoryQueue.RetryFailed(ctx, queue, id); err != nil {
+		return err
+	}
+	q.retries[id]++
+	d, err := q.MemoryQueue.Reserve(ctx, []string{queue}, time.Minute)
+	if err != nil {
+		return err
+	}
+	if d.Envelope.ID != id {
+		return fmt.Errorf("reserved %s after retrying %s", d.Envelope.ID, id)
+	}
+	return q.MemoryQueue.Bury(ctx, d, jobs.Failure{
+		Reason: jobs.ReasonPermanent,
+		Kind:   jobs.KindHandler,
+		Error:  "still broken",
+		At:     time.Now(),
+	})
+}
+
+// TestJobsRetryAllRetriesEachListedJobOnce: a live worker may fail a retried
+// job again before retry --all reads the next page. The same job must not be
+// retried again by this invocation.
+func TestJobsRetryAllRetriesEachListedJobOnce(t *testing.T) {
+	base := jobs.NewMemoryQueue()
+	ctx := context.Background()
+	env := jobs.Envelope{ID: "loop", Name: "send_welcome_email", Version: 1, Payload: json.RawMessage(`{}`)}
+	if err := base.Push(ctx, "mail", env, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := base.Reserve(ctx, []string{"mail"}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Bury(ctx, d, jobs.Failure{Reason: jobs.ReasonPermanent, Kind: jobs.KindHandler, Error: "still broken"}); err != nil {
+		t.Fatal(err)
+	}
+
+	q := &refailingRetryQueue{MemoryQueue: base, retries: map[string]int{}}
+	cfg := config.Default()
+	cfg.Jobs.Driver, cfg.Jobs.Queue = config.JobsDriverRedis, "mail"
+	prevCfg, prevOpen, prevPage := LoadConfig, openJobsQueue, retryAllPage
+	t.Cleanup(func() { LoadConfig, openJobsQueue, retryAllPage = prevCfg, prevOpen, prevPage })
+	LoadConfig = func() (config.Config, error) { return cfg, nil }
+	openJobsQueue = func(config.Config) (jobs.Queue, func() error, error) { return q, func() error { return nil }, nil }
+	retryAllPage = 1
+
+	rootCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	stdout, stderr := new(bytes.Buffer), new(bytes.Buffer)
+	err = ExecuteRoot(rootCtx, NewRoot(stdout, stderr), []string{"jobs", "retry", "--all"})
+	out := stdout.String() + stderr.String()
+	if err != nil {
+		t.Fatalf("retry --all = %v:\n%s", err, out)
+	}
+	if q.retries["loop"] != 1 || strings.Count(out, "Retrying loop on mail.") != 1 {
+		t.Fatalf("retry --all retried loop %d times:\n%s", q.retries["loop"], out)
+	}
+	if left, _ := q.Failed(context.Background(), "mail", 0); len(left) != 1 || left[0].Envelope.ID != "loop" {
+		t.Fatalf("failed after retry --all: %+v, want loop left for the next invocation", left)
+	}
+}
+
 func TestJobsRetryAllSkipsJobsWhoseKeyIsHeld(t *testing.T) {
 	q := jobs.NewMemoryQueue()
 	ctx := context.Background()
