@@ -438,4 +438,3 @@ func TestJobsRetryAllKeepsOrdinaryReadsBounded(t *testing.T) {
 		t.Fatalf("Failed reads = %d, want paged recovery", q.reads)
 	}
 }
-
