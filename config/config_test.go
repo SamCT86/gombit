@@ -2,9 +2,11 @@ package config
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -629,7 +631,7 @@ func TestValidateAcceptsLongJWTSecretInProduction(t *testing.T) {
 }
 
 func TestValidateRejectsDevelopmentPlaceholderInProduction(t *testing.T) {
-	for _, secret := range []string{DevelopmentJWTPlaceholder, historicalDevelopmentJWTPlaceholder} {
+	for _, secret := range []string{DevelopmentJWTPlaceholder, historicalDevelopmentJWTPlaceholder, publishedExampleJWTPlaceholder} {
 		t.Run(secret, func(t *testing.T) {
 			cfg := DefaultFor(EnvironmentProduction)
 			cfg.Auth.JWTSecret = secret
@@ -659,6 +661,95 @@ func TestValidateRejectsDevelopmentPlaceholderInProduction(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPublishedJWTSecretsAreRejectedInProduction(t *testing.T) {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`GOMBIT_JWT_SECRET=['"]?([A-Za-z0-9._-]+)`),
+		regexp.MustCompile(`JWTSecret\s*=\s*"([^"]+)"`),
+	}
+	roots := []string{
+		"README.md",
+		"docs",
+		"examples",
+		"scaffold/templates",
+	}
+	published := map[string][]string{}
+
+	repositoryRoot, err := os.OpenRoot("..")
+	if err != nil {
+		t.Fatalf("open repository root: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := repositoryRoot.Close(); err != nil {
+			t.Errorf("close repository root: %v", err)
+		}
+	})
+	repositoryFS := repositoryRoot.FS()
+
+	for _, root := range roots {
+		err := fs.WalkDir(repositoryFS, root, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			ext := filepath.Ext(path)
+			if ext != ".go" && ext != ".md" && ext != ".tmpl" {
+				return nil
+			}
+			data, err := fs.ReadFile(repositoryFS, path)
+			if err != nil {
+				return err
+			}
+			for _, pattern := range patterns {
+				for _, match := range pattern.FindAllSubmatch(data, -1) {
+					secret := string(match[1])
+					published[secret] = append(published[secret], path)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("scan published JWT secrets under %s: %v", root, err)
+		}
+	}
+
+	if len(published) == 0 {
+		t.Fatal("published JWT secret scan found no literals")
+	}
+	for secret, paths := range published {
+		secret, paths := secret, paths
+		t.Run(secret, func(t *testing.T) {
+			if !IsInsecureJWTSecret(secret) {
+				t.Fatalf("published JWT secret %q from %s is not rejected as insecure", secret, strings.Join(paths, ", "))
+			}
+		})
+	}
+}
+
+func TestLoadFromEnvRejectsPublishedExampleJWTSecretInProduction(t *testing.T) {
+	_, err := LoadFromEnv(mapLookup(map[string]string{
+		envEnv:       string(EnvironmentProduction),
+		envJWTSecret: publishedExampleJWTPlaceholder,
+	}))
+	if err == nil {
+		t.Fatal("LoadFromEnv() error = nil, want published example JWT secret error")
+	}
+	var fieldErrors FieldErrors
+	if !errors.As(err, &fieldErrors) {
+		t.Fatalf("LoadFromEnv() error type = %T, want FieldErrors", err)
+	}
+	if strings.Contains(err.Error(), publishedExampleJWTPlaceholder) {
+		t.Fatalf("LoadFromEnv() error leaked JWT secret: %v", err)
+	}
+	for _, got := range fieldErrors {
+		if got.Field == "Auth.JWTSecret" && got.Value == "" && strings.Contains(got.Message, "placeholder") {
+			return
+		}
+	}
+	t.Fatalf("LoadFromEnv() field errors = %#v, want redacted Auth.JWTSecret placeholder error", []FieldError(fieldErrors))
 }
 
 func TestLoadFromEnvRejectsShortJWTSecretInProduction(t *testing.T) {

@@ -63,6 +63,7 @@ const (
 	DevelopmentJWTPlaceholder = "dev-only-not-for-production"
 
 	historicalDevelopmentJWTPlaceholder = "change-me-in-development-use-a-long-random-value"
+	publishedExampleJWTPlaceholder      = "dev-only-example-jwt-secret-not-for-prod"
 
 	// DefaultAccessTokenTTL is the signed access-token lifetime.
 	DefaultAccessTokenTTL = 15 * time.Minute
@@ -372,11 +373,11 @@ func (c AuthConfig) EffectiveCookieSameSite() CookieSameSite {
 	return c.CookieSameSite
 }
 
-// IsInsecureJWTSecret reports whether secret is a well-known scaffold
+// IsInsecureJWTSecret reports whether secret is a well-known development
 // placeholder that must never be used in production.
 func IsInsecureJWTSecret(secret string) bool {
 	switch strings.TrimSpace(secret) {
-	case DevelopmentJWTPlaceholder, historicalDevelopmentJWTPlaceholder:
+	case DevelopmentJWTPlaceholder, historicalDevelopmentJWTPlaceholder, publishedExampleJWTPlaceholder:
 		return true
 	default:
 		return false
@@ -746,7 +747,7 @@ func validateAuthConfig(errs *FieldErrors, env Environment, cfg AuthConfig) {
 			*errs = append(*errs, FieldError{
 				Field:   "Auth.JWTSecret",
 				Env:     envJWTSecret,
-				Message: "must not use the generated-app development placeholder in production",
+				Message: "must not use a known development placeholder in production",
 			})
 		case len(cfg.JWTSecret) < MinProductionJWTSecretLength:
 			*errs = append(*errs, FieldError{
