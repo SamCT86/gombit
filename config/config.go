@@ -373,7 +373,7 @@ func (c AuthConfig) EffectiveCookieSameSite() CookieSameSite {
 	return c.CookieSameSite
 }
 
-// IsInsecureJWTSecret reports whether secret is a well-known scaffold
+// IsInsecureJWTSecret reports whether secret is a well-known development
 // placeholder that must never be used in production.
 func IsInsecureJWTSecret(secret string) bool {
 	switch strings.TrimSpace(secret) {
@@ -747,7 +747,7 @@ func validateAuthConfig(errs *FieldErrors, env Environment, cfg AuthConfig) {
 			*errs = append(*errs, FieldError{
 				Field:   "Auth.JWTSecret",
 				Env:     envJWTSecret,
-				Message: "must not use the generated-app development placeholder in production",
+				Message: "must not use a known development placeholder in production",
 			})
 		case len(cfg.JWTSecret) < MinProductionJWTSecretLength:
 			*errs = append(*errs, FieldError{
