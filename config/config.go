@@ -63,6 +63,7 @@ const (
 	DevelopmentJWTPlaceholder = "dev-only-not-for-production"
 
 	historicalDevelopmentJWTPlaceholder = "change-me-in-development-use-a-long-random-value"
+	publishedExampleJWTPlaceholder      = "dev-only-example-jwt-secret-not-for-prod"
 
 	// DefaultAccessTokenTTL is the signed access-token lifetime.
 	DefaultAccessTokenTTL = 15 * time.Minute
@@ -376,7 +377,7 @@ func (c AuthConfig) EffectiveCookieSameSite() CookieSameSite {
 // placeholder that must never be used in production.
 func IsInsecureJWTSecret(secret string) bool {
 	switch strings.TrimSpace(secret) {
-	case DevelopmentJWTPlaceholder, historicalDevelopmentJWTPlaceholder:
+	case DevelopmentJWTPlaceholder, historicalDevelopmentJWTPlaceholder, publishedExampleJWTPlaceholder:
 		return true
 	default:
 		return false
