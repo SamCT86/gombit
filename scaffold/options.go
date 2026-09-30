@@ -58,11 +58,11 @@ type Options struct {
 	// skipAtlas bypasses the initial bootstrap migration in tests that stub
 	// go.sum population without a real go.mod/go.sum, mirroring resourcegen's
 	// own skipAtlas seam.
-	skipAtlas        bool
-	Stdin            io.Reader
-	Stdout           io.Writer
-	Stderr           io.Writer
-	IsTTY            func() bool
+	skipAtlas bool
+	Stdin     io.Reader
+	Stdout    io.Writer
+	Stderr    io.Writer
+	IsTTY     func() bool
 }
 
 func (opts *Options) normalize() error {
