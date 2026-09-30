@@ -629,7 +629,7 @@ func TestValidateAcceptsLongJWTSecretInProduction(t *testing.T) {
 }
 
 func TestValidateRejectsDevelopmentPlaceholderInProduction(t *testing.T) {
-	for _, secret := range []string{DevelopmentJWTPlaceholder, historicalDevelopmentJWTPlaceholder} {
+	for _, secret := range []string{DevelopmentJWTPlaceholder, historicalDevelopmentJWTPlaceholder, publishedExampleJWTPlaceholder} {
 		t.Run(secret, func(t *testing.T) {
 			cfg := DefaultFor(EnvironmentProduction)
 			cfg.Auth.JWTSecret = secret
@@ -659,6 +659,29 @@ func TestValidateRejectsDevelopmentPlaceholderInProduction(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadFromEnvRejectsPublishedExampleJWTSecretInProduction(t *testing.T) {
+	_, err := LoadFromEnv(mapLookup(map[string]string{
+		envEnv:       string(EnvironmentProduction),
+		envJWTSecret: publishedExampleJWTPlaceholder,
+	}))
+	if err == nil {
+		t.Fatal("LoadFromEnv() error = nil, want published example JWT secret error")
+	}
+	var fieldErrors FieldErrors
+	if !errors.As(err, &fieldErrors) {
+		t.Fatalf("LoadFromEnv() error type = %T, want FieldErrors", err)
+	}
+	if strings.Contains(err.Error(), publishedExampleJWTPlaceholder) {
+		t.Fatalf("LoadFromEnv() error leaked JWT secret: %v", err)
+	}
+	for _, got := range fieldErrors {
+		if got.Field == "Auth.JWTSecret" && got.Value == "" && strings.Contains(got.Message, "placeholder") {
+			return
+		}
+	}
+	t.Fatalf("LoadFromEnv() field errors = %#v, want redacted Auth.JWTSecret placeholder error", []FieldError(fieldErrors))
 }
 
 func TestLoadFromEnvRejectsShortJWTSecretInProduction(t *testing.T) {
