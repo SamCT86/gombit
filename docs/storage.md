@@ -6,11 +6,17 @@ code depends on `storage.Storage`, never on a filesystem path or an S3 SDK
 call, so moving from local development to S3-compatible storage in
 production changes configuration, not code.
 
-> **Status: the contract only (STORAGE-1).** No driver ships yet. The local
-> filesystem and in-memory drivers (STORAGE-2) and the S3-compatible driver
-> (STORAGE-3) implement this interface, and later issues add upload helpers,
-> signed URLs, direct uploads, and admin fields
+> **Status:** the contract and the local and in-memory drivers. The
+> S3-compatible driver (STORAGE-3), upload helpers, signed URLs, direct
+> uploads, and admin fields follow
 > ([epic #279](https://github.com/gombit-dev/gombit/issues/279)).
+
+Every app has a store: `app.Storage()` returns the driver `GOMBIT_STORAGE_DRIVER`
+names, which is local files under `./storage` by default. A runnable example
+is in [`examples/storage`](../examples/storage/main.go). It serves downloads
+with `Content-Disposition: attachment`, because an uploaded `text/html` or
+`image/svg+xml` object rendered inline would run as a page in the app's
+origin.
 
 ## The interface
 
@@ -142,6 +148,94 @@ same thing on every driver:
 `storage.MapError(ctx, err, notFound, internal)` does that mapping for a
 handler, in the D10 envelope with the request id. The driver's own error text
 never reaches the client.
+
+## Drivers
+
+| `GOMBIT_STORAGE_DRIVER` | Package | For |
+| --- | --- | --- |
+| `local` (default) | `storage/local` | Development and single-host deployments: files on disk |
+| `memory` | `storage/memory` | Tests: objects in the process, nothing on disk |
+
+`framework.New` opens the configured driver into `app.Storage()`.
+`framework.WithStorage(s)` attaches one you opened yourself, for example a
+`memory.New()` in a test. Either way, handlers use the same `storage.Storage`.
+
+### Local
+
+`GOMBIT_STORAGE_LOCAL_ROOT` (default `storage`, relative to the working
+directory) is the root. It is resolved to an absolute path when the app starts
+and created on the first write, so an app that never stores a file never grows
+the directory. `gombit new` gitignores `/storage/`.
+
+- **Layout.** A key is not a path. Each object is one file at
+  `<root>/objects/<h[0:2]>/<h[2:4]>/<h>`, where `h` is the SHA-256 of the key.
+  The file holds the object's bytes followed by a small trailer: a format
+  version, the key, content type, metadata, modification time, and a SHA-256
+  `ETag`. Readers ignore trailer fields they don't know, so a newer version
+  can add fields and still share a root with an older one, as in a rolling
+  deploy. Hashing is
+  what keeps every key its own object on any filesystem. Case variants,
+  `a` alongside `a/b`, long segments and names Windows reserves all just
+  work, and no key can reach outside the root. The files are not meant to
+  be browsed or edited by hand; go through the store.
+- **Streaming, atomic, durable writes.** `Put` streams into a temporary file
+  under `<root>/tmp` in 32 KiB pieces, never holding the object in memory.
+  It then flushes the file, and makes every directory entry on the
+  object's path durable. Only then does it rename the file into place and
+  flush that directory. A directory that exists is not taken to be durable,
+  since another process sharing the root may have created it and not
+  flushed it yet. Each store flushes the entry of every directory under the
+  root on the path once, whoever created it. The root itself is created in
+  a parent directory that must already exist (the store never creates
+  directories above its root). Its entry there is flushed before a
+  `.durable` marker is written in the root; a store that finds no marker
+  flushes the parent itself, which needs read access to the parent. A reader sees the old object or the new one, never
+  part of one. On Linux and macOS, a `Put` or `Delete` that returned
+  survives a crash. If a directory flush before the rename fails, `Put`
+  fails with the object still a temporary file, and the next `Put` flushes
+  again. If the flush after the rename (or a delete's) fails even on a
+  retry, the change has already happened: the call reports success, and
+  `app.Storage()` logs a warning that it may not survive a crash. `Open`
+  reads from disk as you read.
+- **Temporary files.** A failed `Put` removes its temporary file. A process
+  killed mid-`Put` can't, so each store writes its temporary files in its
+  own work directory (`<root>/tmp/w-*`) and holds a lock on that
+  directory's `owner` file while it exists. The file is locked before it
+  gets that name. A store's first `Put` removes the work directories whose
+  owner file it can lock: those of processes that are gone. A live store's
+  directory is never removed, however long its `Put`s wait on their
+  sources, and neither is a directory with no owner file (a store setting
+  it up, or one that died doing so and left it empty). No age or clock is
+  involved. The locks are `flock` (Linux, macOS, the BSDs) and `LockFileEx`
+  (Windows). On any other platform nothing is swept.
+- **Sharing.** Several processes can share one root (an app and its worker).
+  Several *hosts* need a shared filesystem, or an S3-compatible store
+  (STORAGE-3).
+- **Windows.** An open reader keeps the version it opened while a `Put`
+  replaces the object or a `Delete` removes it, as everywhere. The store
+  opens objects with delete sharing and replaces and deletes them with POSIX
+  semantics, which need NTFS on Windows 10 1709 or later. On a filesystem
+  without them (FAT, say), an open reader blocks a replace or delete of its
+  object until it is closed. Windows offers no directory flush a process can
+  request, so writes and deletes there are atomic, but whether they survive
+  a crash is up to the filesystem. Long paths work as they do for the `os`
+  package: paths the store passes to Win32 directly get the extended
+  `\\?\` form when they are long. CI runs the storage packages on Windows.
+- **URLs.** `URL` returns `ErrUnsupported` for now. Serving local files needs
+  the public/private rules of STORAGE-5; serving every object would expose
+  private ones.
+
+In production, point `GOMBIT_STORAGE_LOCAL_ROOT` at a persistent volume. A
+container's working directory is lost when the container is replaced. A
+production app whose root is relative to the working directory logs a warning
+on its first write. An app that never stores a file is never warned.
+
+### Memory
+
+`memory.New()` keeps objects in a map, deterministically, with no disk. It
+keeps the whole contract, but it holds each object in memory. `Keys()` lists
+what was stored, for assertions. `WithClock` fixes `ModTime`, in both
+drivers.
 
 ## Writing a driver
 

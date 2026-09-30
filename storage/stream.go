@@ -108,6 +108,16 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// PutReader returns r as a driver's Put should read it: limited to
+// opts.Size when one is declared (ExpectSize), and stopping when ctx ends
+// (ContextReader). Read it to EOF.
+func PutReader(ctx context.Context, r io.Reader, opts PutOptions) io.Reader {
+	if opts.Size != nil {
+		r = ExpectSize(r, *opts.Size)
+	}
+	return ContextReader(ctx, r)
+}
+
 // ContextReadCloser returns rc bound to ctx, as the reader Storage.Open
 // returns must be: once ctx has ended, every Read fails with ctx's error,
 // and ContextReadCloser closes rc to end a Read in progress. That
