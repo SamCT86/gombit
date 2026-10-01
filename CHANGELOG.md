@@ -43,6 +43,33 @@ version.
     `memory`), and `framework.WithStorage` attaches your own.
   - `examples/storage` shows upload, download and delete handlers
     ([#324](https://github.com/gombit-dev/gombit/issues/324)).
+- The S3-compatible storage driver, `storage/s3` (STORAGE-3), for AWS S3,
+  Cloudflare R2, MinIO and others:
+  - configured with `GOMBIT_STORAGE_DRIVER=s3` and the
+    `GOMBIT_STORAGE_S3_*` settings: bucket, region, endpoint, prefix, keys,
+    path style;
+  - static keys, or the AWS default credential chain (IAM roles); the secret
+    key is redacted;
+  - streaming uploads in at most 8 MiB of memory: one `PutObject` sized to
+    a small object, or sequential 8 MiB multipart parts, aborted on
+    failure (best effort: an abort that failed, or one that ran while a
+    part upload was unanswered, is reported as `*s3.AbortError`, and a
+    bucket lifecycle rule is what guarantees no parts linger);
+  - a `Put` whose publishing request S3 never answered fails with the new
+    `storage.ErrUnknownOutcome` (the key holds the old object or the new
+    one), rather than claiming the key is unchanged; that request is sent
+    once, without the SDK's retries, so its answer is the one classified,
+    and a request never written out (no credentials, a refused connection)
+    is a definite failure;
+  - metadata sent RFC 2047 encoded when not ASCII, so it round-trips;
+  - throttling, 5xx and network failures classified as `ErrUnavailable`, and
+    a missing bucket reported as a configuration error, not a missing object
+    (one `HeadBucket` at a time, its answer kept for a minute);
+  - the prefix checked by `storage.ValidatePrefix`, the same rule
+    `gombit config` applies.
+
+  Its conformance suite runs against MinIO in CI
+  ([#325](https://github.com/gombit-dev/gombit/issues/325)).
 
 ### Changed
 
