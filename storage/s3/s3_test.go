@@ -5,8 +5,10 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -140,6 +142,53 @@ func TestEncodingMatchesTheContractsMeasure(t *testing.T) {
 	}
 }
 
+func TestURLs(t *testing.T) {
+	ctx := context.Background()
+	s, err := New(ctx, Config{
+		Endpoint: "http://127.0.0.1:9", Region: "us-east-1", Bucket: "b", Prefix: "app/",
+		AccessKeyID: "id", SecretAccessKey: "secret", ForcePathStyle: true,
+		PublicPrefix: "public/", PublicURL: "https://cdn.example.com/assets",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, err := s.URL(ctx, "public/a b+c.png", storage.PublicURL()); err != nil || u != "https://cdn.example.com/assets/app/public/a%20b%2Bc.png" {
+		t.Fatalf("public URL = %q, %v", u, err)
+	}
+	if _, err := s.URL(ctx, "private/a.png", storage.PublicURL()); !errors.Is(err, storage.ErrNotPublic) {
+		t.Fatalf("a public URL for a private key = %v", err)
+	}
+	u, err := s.URL(ctx, "private/a.png", storage.SignedURL(15*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(u, "http://127.0.0.1:9/b/app/private/a.png?") || !strings.Contains(u, "X-Amz-Expires=900") || !strings.Contains(u, "X-Amz-Signature=") {
+		t.Fatalf("signed URL = %q", u)
+	}
+	if _, err := s.URL(ctx, "k", storage.SignedURL(storage.MaxURLExpiry+time.Second)); !errors.Is(err, storage.ErrInvalidOptions) {
+		t.Fatalf("a lifetime over the maximum = %v", err)
+	}
+
+	noPublic, err := New(ctx, Config{Region: "us-east-1", Bucket: "b", PublicPrefix: "public/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := noPublic.URL(ctx, "public/a", storage.PublicURL()); !errors.Is(err, storage.ErrUnsupported) {
+		t.Fatalf("a public URL with no PublicURL configured = %v, want ErrUnsupported", err)
+	}
+	for _, bad := range []Config{
+		{Region: "r", Bucket: "b", PublicPrefix: "public"},
+		{Region: "r", Bucket: "b", PublicURL: "cdn.example.com"},
+		{Region: "r", Bucket: "b", PublicURL: "https://cdn.example.com/"},
+		{Region: "r", Bucket: "b", PublicURL: "https://cdn.example.com?x=1"},
+		{Region: "r", Bucket: "b", PublicURL: "ftp://cdn.example.com"},
+	} {
+		if _, err := New(ctx, bad); err == nil {
+			t.Errorf("New(%+v) succeeded", bad)
+		}
+	}
+}
+
 // TestPrefixRuleIsShared: config validation and New accept exactly the
 // same prefixes, in both directions: one rule (storage.ValidatePrefix).
 // A prefix is a valid key followed by '/' that leaves room for a key.
@@ -173,6 +222,69 @@ func TestPrefixRuleIsShared(t *testing.T) {
 		}
 		if newErr != nil && !errors.Is(newErr, storage.ErrInvalidKey) {
 			t.Errorf("prefix %.40q: New = %v, want ErrInvalidKey", prefix, newErr)
+		}
+		// The public prefix follows the same rule.
+		pubErr := storage.ValidatePublicPrefix(prefix)
+		pubCfgErr := config.ValidateStorage(config.StorageConfig{Driver: config.StorageDriverMemory, PublicPrefix: prefix})
+		if (pubErr == nil) != valid || (pubCfgErr == nil) != valid {
+			t.Errorf("public prefix %.40q: storage = %v, config = %v; want valid = %v", prefix, pubErr, pubCfgErr, valid)
+		}
+	}
+}
+
+// TestPublicURLRuleIsShared: config validation and New accept exactly the
+// same PublicURL, in both directions: one rule.
+func TestPublicURLRuleIsShared(t *testing.T) {
+	ctx := context.Background()
+	for publicURL, valid := range map[string]bool{
+		"":                                true,
+		"https://cdn.example.com":         true,
+		"https://cdn.example.com/assets":  true,
+		"http://127.0.0.1:9000/bucket":    true,
+		"https://cdn.example.com/":        false,
+		"https://cdn.example.com/a%2Fb":   false,
+		"cdn.example.com":                 false,
+		"/assets":                         false,
+		"ftp://cdn.example.com":           false,
+		"https://cdn.example.com?x=1":     false,
+		"https://cdn.example.com#f":       false,
+		"https://user:pw@cdn.example.com": false,
+	} {
+		_, newErr := New(ctx, Config{Bucket: "b", Region: "us-east-1", PublicURL: publicURL})
+		cfgErr := config.ValidateStorage(config.StorageConfig{Driver: config.StorageDriverS3, S3: config.S3StorageConfig{Bucket: "b", Region: "us-east-1", PublicURL: publicURL}})
+		if (newErr == nil) != valid || (cfgErr == nil) != valid {
+			t.Errorf("PublicURL %q: New = %v, config = %v; want valid = %v", publicURL, newErr, cfgErr, valid)
+		}
+	}
+}
+
+// TestSignedURLLifetimeIsWholeSeconds: every lifetime URLOptions accepts
+// is a valid X-Amz-Expires (whole seconds, 1 to 604800), sent as it is; a
+// finer one is refused.
+func TestSignedURLLifetimeIsWholeSeconds(t *testing.T) {
+	ctx := context.Background()
+	s, err := New(ctx, Config{Endpoint: "http://127.0.0.1:9", Region: "us-east-1", Bucket: "b", AccessKeyID: "id", SecretAccessKey: "secret", ForcePathStyle: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.URL(ctx, "k", storage.SignedURL(time.Millisecond)); !errors.Is(err, storage.ErrInvalidOptions) {
+		t.Fatalf("URL(1ms) = %v, want ErrInvalidOptions", err)
+	}
+	for ttl, want := range map[time.Duration]string{
+		time.Second:          "1",
+		time.Minute:          "60",
+		storage.MaxURLExpiry: "604800",
+	} {
+		u, err := s.URL(ctx, "k", storage.SignedURL(ttl))
+		if err != nil {
+			t.Fatalf("URL(%s) = %v", ttl, err)
+		}
+		parsed, err := url.Parse(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parsed.Query().Get("X-Amz-Expires"); got != want {
+			t.Errorf("SignedURL(%s): X-Amz-Expires = %q, want %q", ttl, got, want)
 		}
 	}
 }

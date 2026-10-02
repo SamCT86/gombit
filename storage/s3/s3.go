@@ -81,6 +81,7 @@ import (
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
+	"github.com/gombit-dev/gombit/internal/urlbase"
 	"github.com/gombit-dev/gombit/storage"
 )
 
@@ -101,6 +102,17 @@ type Config struct {
 	// ForcePathStyle addresses the bucket in the URL path (MinIO and most
 	// S3-compatible services), not the host name.
 	ForcePathStyle bool
+	// PublicPrefix makes the keys under it public (storage.IsPublic); empty
+	// makes none public. The bucket must serve them to anyone: a bucket
+	// policy allowing s3:GetObject on Bucket/Prefix+PublicPrefix*, or a
+	// CDN in front of it.
+	PublicPrefix string
+	// PublicURL is the URL public objects are read from, standing for the
+	// bucket's root: a public object's URL is PublicURL + "/" + Prefix +
+	// key. A CDN ("https://cdn.example.com"), a custom domain, or the
+	// bucket's own address. Empty: URL answers storage.ErrUnsupported for a
+	// public URL (signed URLs still work).
+	PublicURL string
 }
 
 // String describes the store without its credentials.
@@ -117,9 +129,12 @@ func (c Config) endpointName() string {
 
 // Store is an S3-backed storage.Storage. It is safe for concurrent use.
 type Store struct {
-	client *awss3.Client
-	bucket string
-	prefix string
+	client    *awss3.Client
+	presign   *awss3.PresignClient
+	bucket    string
+	prefix    string
+	public    string // PublicPrefix
+	publicURL string
 	// bucketState is what a HEAD request's 404 needs: it does not say
 	// whether the object or the bucket is missing (see checkBucket).
 	bucketState bucketCheck
@@ -266,7 +281,23 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
-	return &Store{client: client, bucket: cfg.Bucket, prefix: cfg.Prefix}, nil
+	if err := storage.ValidatePublicPrefix(cfg.PublicPrefix); err != nil {
+		return nil, fmt.Errorf("s3 storage: %v", err)
+	}
+	// The rule config.Validate applies to GOMBIT_STORAGE_S3_PUBLIC_URL too.
+	if cfg.PublicURL != "" {
+		if problem := urlbase.Root(cfg.PublicURL); problem != "" {
+			return nil, fmt.Errorf("s3 storage: public URL %q: %s", cfg.PublicURL, problem)
+		}
+	}
+	return &Store{
+		client:    client,
+		presign:   awss3.NewPresignClient(client),
+		bucket:    cfg.Bucket,
+		prefix:    cfg.Prefix,
+		public:    cfg.PublicPrefix,
+		publicURL: cfg.PublicURL,
+	}, nil
 }
 
 // objectKey is key's S3 object key, validated and prefixed.
@@ -580,11 +611,18 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 	return storage.Wrap("delete", key, classify(ctx, err))
 }
 
-// URL implements storage.Storage. Public and signed URLs, and the
-// visibility rules they depend on, come with STORAGE-5; until then it
-// returns storage.ErrUnsupported (after validating its arguments).
+// URL implements storage.Storage. A public URL is PublicURL + "/" + the
+// escaped object key, for a key under PublicPrefix (storage.ErrNotPublic
+// otherwise; storage.ErrUnsupported without a PublicURL). A signed URL is a
+// presigned GetObject request (SigV4 query parameters) valid for
+// opts.Expires counted from its X-Amz-Date, the signing second (see
+// storage.SignedURL); it carries the credentials' authority, so it works for a
+// private object, and stops working when it expires or the credentials
+// are revoked (a URL signed with temporary credentials, such as an IAM
+// role's, also ends when they do).
 func (s *Store) URL(ctx context.Context, key string, opts storage.URLOptions) (string, error) {
-	if _, err := s.objectKey(key); err != nil {
+	full, err := s.objectKey(key)
+	if err != nil {
 		return "", storage.Wrap("url", key, err)
 	}
 	if err := storage.ValidateURLOptions(opts); err != nil {
@@ -593,7 +631,23 @@ func (s *Store) URL(ctx context.Context, key string, opts storage.URLOptions) (s
 	if err := ctx.Err(); err != nil {
 		return "", storage.Wrap("url", key, err)
 	}
-	return "", storage.Wrap("url", key, storage.ErrUnsupported)
+	if !opts.Signed {
+		switch {
+		case !storage.IsPublic(s.public, key):
+			return "", storage.Wrap("url", key, storage.ErrNotPublic)
+		case s.publicURL == "":
+			return "", storage.Wrap("url", key, fmt.Errorf("%w: no public URL is configured", storage.ErrUnsupported))
+		}
+		return s.publicURL + "/" + storage.EscapeKey(full), nil
+	}
+	req, err := s.presign.PresignGetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(full),
+	}, awss3.WithPresignExpires(opts.Expires)) // whole seconds (URLOptions): X-Amz-Expires
+	if err != nil {
+		return "", storage.Wrap("url", key, classify(ctx, err))
+	}
+	return req.URL, nil
 }
 
 // checkBucket returns notFound when the bucket exists, and a

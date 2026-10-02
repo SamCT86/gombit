@@ -647,12 +647,18 @@ func checkInvalidOptions(t testing.TB, s storage.Storage) {
 	if got, info := read(t, s, "opts-kept"); string(got) != "previous" || info.ContentType != "text/plain" {
 		t.Fatalf("a refused overwrite left %q (%s), want the previous object", got, info.ContentType)
 	}
-	for _, opts := range []storage.URLOptions{storage.SignedURL(0), storage.SignedURL(-time.Second), {Expires: time.Minute}} {
+	// A lifetime is whole seconds, as S3 counts it: a finer one is refused,
+	// on every driver, rather than given a lifetime the drivers would count
+	// differently.
+	for _, opts := range []storage.URLOptions{storage.SignedURL(0), storage.SignedURL(-time.Second), {Expires: time.Minute}, storage.SignedURL(time.Millisecond), storage.SignedURL(1500 * time.Millisecond)} {
 		_, err := s.URL(ctxFor(t), "opts", opts)
 		if !errors.Is(err, storage.ErrInvalidOptions) {
-			t.Fatalf("URL(%+v) = %v, want storage.ErrInvalidOptions: a signed URL must never widen into a permanent one", opts, err)
+			t.Fatalf("URL(%+v) = %v, want storage.ErrInvalidOptions", opts, err)
 		}
 		wantErr(t, err, storage.ErrInvalidOptions, "url", "opts")
+	}
+	if _, err := s.URL(ctxFor(t), "opts", storage.SignedURL(storage.MaxURLExpiry+time.Second)); !errors.Is(err, storage.ErrInvalidOptions) {
+		t.Fatalf("URL with a lifetime over storage.MaxURLExpiry = %v, want storage.ErrInvalidOptions", err)
 	}
 }
 
@@ -843,11 +849,15 @@ func checkOpenFollowsContext(t testing.TB, s storage.Storage) {
 
 // checkURL: a driver either produces URLs or says it cannot; it never
 // returns an empty URL without an error, and it never checks that the
-// object exists (a URL for an upload names a key not stored yet).
+// object exists (a URL for an upload names a key not stored yet). A public
+// URL may be refused as storage.ErrNotPublic (the suite's keys are not
+// under a public prefix); a signed one never is.
 func checkURL(t testing.TB, s storage.Storage) {
 	put(t, s, "linked/file.txt", []byte("x"), storage.PutOptions{})
 	for _, key := range []string{"linked/file.txt", "linked/never-stored.txt"} {
-		for _, opts := range []storage.URLOptions{storage.PublicURL(), storage.SignedURL(time.Minute)} {
+		// The bounds of a signed URL's lifetime too: a second and
+		// MaxURLExpiry are valid.
+		for _, opts := range []storage.URLOptions{storage.PublicURL(), storage.SignedURL(time.Minute), storage.SignedURL(time.Second), storage.SignedURL(storage.MaxURLExpiry)} {
 			checkOneURL(t, s, key, opts)
 		}
 	}
@@ -859,6 +869,10 @@ func checkOneURL(t testing.TB, s storage.Storage, key string, opts storage.URLOp
 	switch {
 	case errors.Is(err, storage.ErrUnsupported):
 		wantErr(t, err, storage.ErrUnsupported, "url", key)
+	case errors.Is(err, storage.ErrNotPublic) && !opts.Signed:
+		wantErr(t, err, storage.ErrNotPublic, "url", key)
+	case errors.Is(err, storage.ErrNotPublic):
+		t.Fatalf("URL(%q, %+v) = %v: a signed URL works for a private object", key, opts, err)
 	case errors.Is(err, storage.ErrNotFound):
 		t.Fatalf("URL(%q, %+v) = %v: URL must not check that the object exists", key, opts, err)
 	case err != nil:

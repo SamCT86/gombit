@@ -68,8 +68,10 @@ type Storage interface {
 	// so a retried Delete is safe.
 	Delete(ctx context.Context, key string) error
 
-	// URL returns a URL a client can fetch the object from: a public URL,
-	// or a signed one that expires (see URLOptions). A driver that cannot
+	// URL returns a URL a client can fetch the object from: a permanent
+	// public URL for a public object (ErrNotPublic for a private one; see
+	// IsPublic), or a signed one that works for any object until it
+	// expires (see URLOptions; at most MaxURLExpiry). A driver that cannot
 	// produce one returns ErrUnsupported. URL does not check that the
 	// object exists, and it does not authorize anyone: decide who may have
 	// the URL before asking for it.
@@ -138,6 +140,9 @@ type URLOptions struct {
 	// Expires is how long a signed URL is valid: it must be positive for a
 	// signed URL, and zero for a public one (ErrInvalidOptions otherwise),
 	// so a zero or negative lifetime can never widen into a permanent URL.
+	// It is a whole number of seconds (ErrInvalidOptions otherwise),
+	// counted from the start of the second the URL is signed in, as S3
+	// counts it, on every driver.
 	Expires time.Duration
 }
 
@@ -145,9 +150,14 @@ type URLOptions struct {
 // credentials.
 func PublicURL() URLOptions { return URLOptions{} }
 
-// SignedURL asks for a URL that grants access to the object until ttl has
-// passed. ttl must be positive: URL fails with ErrInvalidOptions otherwise,
-// rather than returning anything longer-lived.
+// SignedURL asks for a URL that grants access to the object for ttl,
+// counted from the start of the second the URL is signed in, as S3 counts
+// a presigned URL's lifetime: it expires at that second plus ttl, so it
+// works for more than ttl minus one second and at most ttl after URL
+// returns (less any time URL itself takes). ttl must be a positive whole
+// number of seconds, at most MaxURLExpiry: URL fails with
+// ErrInvalidOptions otherwise, rather than returning anything longer-lived
+// or counted differently by another driver.
 func SignedURL(ttl time.Duration) URLOptions { return URLOptions{Signed: true, Expires: ttl} }
 
 // KnownSize is a PutOptions.Size of exactly n bytes.
