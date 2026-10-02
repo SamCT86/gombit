@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gombit-dev/gombit/storage"
+	"github.com/gombit-dev/gombit/storage/presign"
 )
 
 // Store is an in-memory storage.Storage. The zero value is not usable; call
@@ -24,6 +25,7 @@ type Store struct {
 	mu      sync.RWMutex
 	objects map[string]object
 	now     func() time.Time
+	urls    *presign.Signer
 }
 
 type object struct {
@@ -40,6 +42,13 @@ func WithClock(now func() time.Time) Option {
 	return func(s *Store) { s.now = now }
 }
 
+// WithURLs gives the store URLs, made by signer and served by
+// presign.Handler (which the application mounts at signer.Path(); framework.New
+// does). Without it, URL returns storage.ErrUnsupported.
+func WithURLs(signer *presign.Signer) Option {
+	return func(s *Store) { s.urls = signer }
+}
+
 // New returns an empty in-memory store.
 func New(opts ...Option) *Store {
 	s := &Store{objects: map[string]object{}, now: time.Now}
@@ -50,6 +59,11 @@ func New(opts ...Option) *Store {
 }
 
 var _ storage.Storage = (*Store)(nil)
+
+// reader is an object's bytes, seekable (for Range requests).
+type reader struct{ *bytes.Reader }
+
+func (reader) Close() error { return nil }
 
 // Put implements storage.Storage. The object is read completely before it
 // replaces the old one, so a failed Put changes nothing.
@@ -114,7 +128,7 @@ func (s *Store) Open(ctx context.Context, key string) (io.ReadCloser, storage.Ob
 	if err != nil {
 		return nil, storage.ObjectInfo{}, err
 	}
-	return storage.ContextReadCloser(ctx, io.NopCloser(bytes.NewReader(o.data))), copyInfo(o.info), nil
+	return storage.ContextReadCloser(ctx, reader{bytes.NewReader(o.data)}), copyInfo(o.info), nil
 }
 
 // Stat implements storage.Storage.
@@ -140,8 +154,10 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// URL implements storage.Storage. Objects in memory have no URL: it returns
-// storage.ErrUnsupported (after validating its arguments).
+// URL implements storage.Storage with the store's presign.Signer
+// (WithURLs): a public URL for a key under its public prefix, or a signed
+// one. Without a Signer it returns storage.ErrUnsupported (after
+// validating its arguments).
 func (s *Store) URL(ctx context.Context, key string, opts storage.URLOptions) (string, error) {
 	if err := storage.ValidateKey(key); err != nil {
 		return "", storage.Wrap("url", key, err)
@@ -152,7 +168,11 @@ func (s *Store) URL(ctx context.Context, key string, opts storage.URLOptions) (s
 	if err := ctx.Err(); err != nil {
 		return "", storage.Wrap("url", key, err)
 	}
-	return "", storage.Wrap("url", key, storage.ErrUnsupported)
+	if s.urls == nil {
+		return "", storage.Wrap("url", key, storage.ErrUnsupported)
+	}
+	u, err := s.urls.URL(key, opts)
+	return u, storage.Wrap("url", key, err)
 }
 
 // Keys returns the stored keys, for tests that assert what was written.

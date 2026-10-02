@@ -3,10 +3,14 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gombit-dev/gombit/internal/storagekey"
+	"github.com/gombit-dev/gombit/internal/urlbase"
 )
 
 const (
@@ -30,6 +34,17 @@ const (
 	envJobsNamespace           = "GOMBIT_JOBS_NAMESPACE"
 	envStorageDriver           = "GOMBIT_STORAGE_DRIVER"
 	envStorageLocalRoot        = "GOMBIT_STORAGE_LOCAL_ROOT"
+	envStorageS3Endpoint       = "GOMBIT_STORAGE_S3_ENDPOINT"
+	envStorageS3Region         = "GOMBIT_STORAGE_S3_REGION"
+	envStorageS3Bucket         = "GOMBIT_STORAGE_S3_BUCKET"
+	envStorageS3Prefix         = "GOMBIT_STORAGE_S3_PREFIX"
+	envStorageS3AccessKeyID    = "GOMBIT_STORAGE_S3_ACCESS_KEY_ID"
+	envStorageS3SecretKey      = "GOMBIT_STORAGE_S3_SECRET_ACCESS_KEY" // #nosec G101 -- environment variable name, not a credential.
+	envStorageS3PathStyle      = "GOMBIT_STORAGE_S3_FORCE_PATH_STYLE"
+	envStorageS3PublicURL      = "GOMBIT_STORAGE_S3_PUBLIC_URL"
+	envStoragePublicPrefix     = "GOMBIT_STORAGE_PUBLIC_PREFIX"
+	envStorageURLSecret        = "GOMBIT_STORAGE_URL_SECRET" // #nosec G101 -- environment variable name, not a credential.
+	envStorageLocalURL         = "GOMBIT_STORAGE_LOCAL_URL"
 	envRedisAddr               = "GOMBIT_REDIS_ADDR"
 	envRedisUsername           = "GOMBIT_REDIS_USERNAME"
 	envRedisPassword           = "GOMBIT_REDIS_PASSWORD" // #nosec G101 -- environment variable name, not a credential.
@@ -231,7 +246,25 @@ const (
 	// StorageDriverMemory keeps objects in process memory, for tests.
 	// Stored objects are lost when the process exits.
 	StorageDriverMemory StorageDriver = "memory"
+	// StorageDriverS3 stores objects in an S3-compatible bucket (AWS S3,
+	// Cloudflare R2, MinIO, ...), configured by Storage.S3.
+	StorageDriverS3 StorageDriver = "s3"
 )
+
+// DefaultStorageS3Region is the S3 region unless GOMBIT_STORAGE_S3_REGION
+// says otherwise (many S3-compatible services accept any region).
+const DefaultStorageS3Region = "us-east-1"
+
+// DefaultStoragePublicPrefix is the key prefix of public objects unless
+// GOMBIT_STORAGE_PUBLIC_PREFIX says otherwise.
+const DefaultStoragePublicPrefix = "public/"
+
+// DefaultStorageLocalURL is where the application serves the local and
+// memory drivers' URLs unless GOMBIT_STORAGE_LOCAL_URL says otherwise.
+const DefaultStorageLocalURL = "/_storage"
+
+// MinStorageURLSecretLength is the shortest GOMBIT_STORAGE_URL_SECRET.
+const MinStorageURLSecretLength = 32
 
 // DefaultStorageLocalRoot is the local driver's root directory, relative to
 // the working directory, unless GOMBIT_STORAGE_LOCAL_ROOT says otherwise.
@@ -241,7 +274,43 @@ const DefaultStorageLocalRoot = "storage"
 // framework.New into App.Storage().
 type StorageConfig struct {
 	Driver StorageDriver
-	Local  LocalStorageConfig
+	// PublicPrefix makes the objects whose keys start with it public: they
+	// have permanent URLs (storage.PublicURL). Empty makes none public.
+	// Default "public/".
+	PublicPrefix string
+	// URLSecret signs the local and memory drivers' URLs (HMAC-SHA256), at
+	// least 32 bytes. Empty derives one from Auth.JWTSecret; with neither,
+	// those drivers have no URLs.
+	URLSecret string
+	Local     LocalStorageConfig
+	S3        S3StorageConfig
+}
+
+// S3StorageConfig configures the S3-compatible driver.
+type S3StorageConfig struct {
+	// Endpoint is the service's base URL ("https://<account>.r2.cloudflarestorage.com",
+	// "http://127.0.0.1:9000" for a local MinIO). Empty means AWS S3.
+	Endpoint string
+	// Region signs requests. Default us-east-1.
+	Region string
+	// Bucket holds the objects. Required.
+	Bucket string
+	// Prefix, when set, is put before every key ("myapp/"), so several apps
+	// or environments can share a bucket.
+	Prefix string
+	// AccessKeyID and SecretAccessKey are static credentials. Leave both
+	// empty to use the AWS default credential chain (environment, shared
+	// config, an IAM role on EC2/ECS/Fargate).
+	AccessKeyID     string
+	SecretAccessKey string
+	// ForcePathStyle addresses the bucket in the path
+	// (endpoint/bucket/key) rather than the host (bucket.endpoint/key), as
+	// MinIO and many S3-compatible services need.
+	ForcePathStyle bool
+	// PublicURL is the base URL public objects are read from, standing for
+	// the bucket's root (a CDN, a custom domain, or the bucket's address).
+	// Empty: public objects have no URL (signed URLs still work).
+	PublicURL string
 }
 
 // LocalStorageConfig configures the local filesystem driver.
@@ -250,6 +319,10 @@ type LocalStorageConfig struct {
 	// resolved against the working directory when the app starts. It is
 	// created on the first write.
 	Root string
+	// URL is where the application serves stored objects' URLs, for the
+	// local and memory drivers: a path ("/_storage", the default) or an
+	// absolute URL ending in one. Empty: those drivers have no URLs.
+	URL string
 }
 
 // RedisConfig contains go-redis client configuration.
@@ -436,8 +509,10 @@ func DefaultFor(env Environment) Config {
 			Namespace: DefaultCacheNamespace("Gombit", env),
 		},
 		Storage: StorageConfig{
-			Driver: StorageDriverLocal,
-			Local:  LocalStorageConfig{Root: DefaultStorageLocalRoot},
+			Driver:       StorageDriverLocal,
+			PublicPrefix: DefaultStoragePublicPrefix,
+			Local:        LocalStorageConfig{Root: DefaultStorageLocalRoot, URL: DefaultStorageLocalURL},
+			S3:           S3StorageConfig{Region: DefaultStorageS3Region},
 		},
 		Logging: LoggingConfig{
 			Level: LogLevelInfo,
@@ -542,6 +617,17 @@ func LoadFromEnv(lookup EnvLookup) (Config, error) {
 	}
 	applyStorageDriver(lookup, envStorageDriver, &cfg.Storage.Driver)
 	applyString(lookup, envStorageLocalRoot, &cfg.Storage.Local.Root)
+	applyString(lookup, envStorageS3Endpoint, &cfg.Storage.S3.Endpoint)
+	applyString(lookup, envStorageS3Region, &cfg.Storage.S3.Region)
+	applyString(lookup, envStorageS3Bucket, &cfg.Storage.S3.Bucket)
+	applyString(lookup, envStorageS3Prefix, &cfg.Storage.S3.Prefix)
+	applyString(lookup, envStorageS3AccessKeyID, &cfg.Storage.S3.AccessKeyID)
+	applyString(lookup, envStorageS3SecretKey, &cfg.Storage.S3.SecretAccessKey)
+	applyBool(lookup, envStorageS3PathStyle, "Storage.S3.ForcePathStyle", &cfg.Storage.S3.ForcePathStyle, &errs)
+	applyString(lookup, envStorageS3PublicURL, &cfg.Storage.S3.PublicURL)
+	applyString(lookup, envStoragePublicPrefix, &cfg.Storage.PublicPrefix)
+	applyString(lookup, envStorageURLSecret, &cfg.Storage.URLSecret)
+	applyString(lookup, envStorageLocalURL, &cfg.Storage.Local.URL)
 	applyLogLevel(lookup, envLogLevel, &cfg.Logging.Level)
 	applyLogSink(lookup, envLogSink, &cfg.Logging.Sink)
 	applyString(lookup, envJWTSecret, &cfg.Auth.JWTSecret)
@@ -949,8 +1035,18 @@ func ValidateStorage(cfg StorageConfig) error {
 }
 
 func validateStorageConfig(errs *FieldErrors, cfg StorageConfig) {
+	// The key rules of package storage (storage.ValidatePublicPrefix), which
+	// the drivers apply too: one rule, so the two cannot disagree.
+	if reason := storagekey.PrefixProblem(cfg.PublicPrefix); reason != "" {
+		*errs = append(*errs, FieldError{Field: "Storage.PublicPrefix", Env: envStoragePublicPrefix, Value: cfg.PublicPrefix, Message: "must be empty (no public objects) or a valid storage key followed by '/' (" + reason + ")"})
+	}
+	if cfg.URLSecret != "" && len(cfg.URLSecret) < MinStorageURLSecretLength {
+		// Never echo the value: it is a secret.
+		*errs = append(*errs, FieldError{Field: "Storage.URLSecret", Env: envStorageURLSecret, Message: fmt.Sprintf("must be at least %d bytes", MinStorageURLSecretLength)})
+	}
 	switch cfg.Driver {
 	case StorageDriverLocal:
+		validateStorageLocalURL(errs, cfg.Local.URL)
 		if strings.TrimSpace(cfg.Local.Root) == "" {
 			*errs = append(*errs, FieldError{
 				Field:   "Storage.Local.Root",
@@ -960,13 +1056,58 @@ func validateStorageConfig(errs *FieldErrors, cfg StorageConfig) {
 			})
 		}
 	case StorageDriverMemory:
+		validateStorageLocalURL(errs, cfg.Local.URL)
+	case StorageDriverS3:
+		validateS3StorageConfig(errs, cfg.S3)
 	default:
 		*errs = append(*errs, FieldError{
 			Field:   "Storage.Driver",
 			Env:     envStorageDriver,
 			Value:   string(cfg.Driver),
-			Message: "must be one of local, memory",
+			Message: "must be one of local, memory, s3",
 		})
+	}
+}
+
+// validateStorageLocalURL checks where the local and memory drivers' URLs
+// are served: empty (none), a path, or an http(s) URL with one.
+func validateStorageLocalURL(errs *FieldErrors, raw string) {
+	if raw == "" {
+		return // no URLs
+	}
+	// The rule presign.New applies (internal/urlbase): one rule, so a URL
+	// that validates here is one the local and memory drivers can serve.
+	if _, problem := urlbase.Base(raw); problem != "" {
+		*errs = append(*errs, FieldError{Field: "Storage.Local.URL", Env: envStorageLocalURL, Value: raw, Message: "must be a path such as /_storage, or an http(s) URL ending in one, without a trailing '/', query, or fragment (" + problem + ")"})
+	}
+}
+
+func validateS3StorageConfig(errs *FieldErrors, cfg S3StorageConfig) {
+	if strings.TrimSpace(cfg.Bucket) == "" {
+		*errs = append(*errs, FieldError{Field: "Storage.S3.Bucket", Env: envStorageS3Bucket, Message: "must not be empty with the s3 storage driver"})
+	}
+	if strings.TrimSpace(cfg.Region) == "" {
+		*errs = append(*errs, FieldError{Field: "Storage.S3.Region", Env: envStorageS3Region, Message: "must not be empty with the s3 storage driver"})
+	}
+	if cfg.Endpoint != "" {
+		u, err := url.Parse(cfg.Endpoint)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			*errs = append(*errs, FieldError{Field: "Storage.S3.Endpoint", Env: envStorageS3Endpoint, Value: cfg.Endpoint, Message: "must be an http or https URL"})
+		}
+	}
+	if (cfg.AccessKeyID == "") != (cfg.SecretAccessKey == "") {
+		// Never echo either value: one of them is a secret.
+		*errs = append(*errs, FieldError{Field: "Storage.S3.AccessKeyID", Env: envStorageS3AccessKeyID, Message: "set both GOMBIT_STORAGE_S3_ACCESS_KEY_ID and GOMBIT_STORAGE_S3_SECRET_ACCESS_KEY, or neither (the default AWS credential chain)"})
+	}
+	if cfg.PublicURL != "" {
+		if problem := urlbase.Root(cfg.PublicURL); problem != "" { // the rule s3.New applies
+			*errs = append(*errs, FieldError{Field: "Storage.S3.PublicURL", Env: envStorageS3PublicURL, Value: cfg.PublicURL, Message: "must be an http or https URL without a trailing '/', query, or fragment"})
+		}
+	}
+	// The key rules of package storage (storage.ValidatePrefix), which the
+	// driver applies too: one rule, so the two cannot disagree.
+	if reason := storagekey.PrefixProblem(cfg.Prefix); reason != "" {
+		*errs = append(*errs, FieldError{Field: "Storage.S3.Prefix", Env: envStorageS3Prefix, Value: cfg.Prefix, Message: "must be a valid storage key followed by '/' (" + reason + ")"})
 	}
 }
 

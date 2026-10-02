@@ -42,6 +42,8 @@ type fake struct {
 	readIgnoresCtx   bool // Open/Stat/Delete/URL never check ctx
 	caseInsensitive  bool // keys are compared case-insensitively
 	urlNeedsObject   bool // URL returns ErrNotFound for a missing object
+	anyExpiry        bool // URL accepts a lifetime over MaxURLExpiry
+	signedNotPublic  bool // URL refuses a signed URL for a private object
 	bareErrors       bool // returns bare sentinels, not *storage.Error
 	aliasMetadata    bool // stores and returns one shared metadata map
 	openDetached     bool // Open's reader ignores the context once returned
@@ -309,8 +311,11 @@ func (f *fake) URL(ctx context.Context, key string, opts storage.URLOptions) (st
 	if err := f.readCtx(ctx); err != nil {
 		return "", f.wrap("url", key, err)
 	}
-	if err := storage.ValidateURLOptions(opts); err != nil {
+	if err := storage.ValidateURLOptions(opts); err != nil && (!f.anyExpiry || opts.Expires <= storage.MaxURLExpiry) {
 		return "", f.wrap("url", key, err)
+	}
+	if f.signedNotPublic {
+		return "", f.wrap("url", key, storage.ErrNotPublic)
 	}
 	if f.urlNeedsObject {
 		if _, err := f.get("url", key); err != nil {
@@ -405,6 +410,8 @@ func TestSuiteCatchesBrokenDrivers(t *testing.T) {
 		{"PortableKeys", func(f *fake) { f.caseInsensitive = true }, "two keys share one object"},
 		{"URL", func(f *fake) { f.urlNeedsObject = true }, "must not check that the object exists"},
 		{"NoPartialReads", func(f *fake) { f.nonAtomic = true }, "part of the object being written"},
+		{"InvalidOptions", func(f *fake) { f.anyExpiry = true }, "MaxURLExpiry"},
+		{"URL", func(f *fake) { f.signedNotPublic = true }, "a signed URL works for a private object"},
 		{"NoPartialReads", func(f *fake) { f.nonAtomicFirst = true }, "mid-Put of a new key"},
 		{"MetadataIsOwned", func(f *fake) { f.aliasMetadata = true }, "the stored metadata changed without a Put"},
 		{"MetadataIsOwned", func(f *fake) { f.resultIsInput = true }, "shares the caller's map"},
