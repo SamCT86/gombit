@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+
+	"golang.org/x/mod/module"
 )
 
 const (
@@ -165,17 +167,12 @@ func validateName(name string) error {
 	return nil
 }
 
-func validateModule(module string) error {
-	if module == "" {
+func validateModule(modulePath string) error {
+	if modulePath == "" {
 		return errors.New("scaffold: module path is required")
 	}
-	if strings.Contains(module, "\\") || strings.Contains(module, " ") {
-		return fmt.Errorf("scaffold: invalid module path %q", module)
-	}
-	for _, part := range strings.Split(module, "/") {
-		if part == "" || part == "." || part == ".." {
-			return fmt.Errorf("scaffold: invalid module path %q", module)
-		}
+	if err := module.CheckPath(modulePath); err != nil {
+		return fmt.Errorf("scaffold: invalid module path %q: %w", modulePath, err)
 	}
 	return nil
 }
