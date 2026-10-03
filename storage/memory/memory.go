@@ -101,8 +101,11 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader, opts storage.P
 		info.Metadata = nil
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, taken := s.objects[key]; taken && opts.IfAbsent {
+		return storage.ObjectInfo{}, storage.Wrap("put", key, storage.ErrExists) // checked and stored under one lock
+	}
 	s.objects[key] = object{data: data, info: info}
-	s.mu.Unlock()
 	return copyInfo(info), nil
 }
 
@@ -159,20 +162,17 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 // one. Without a Signer it returns storage.ErrUnsupported (after
 // validating its arguments).
 func (s *Store) URL(ctx context.Context, key string, opts storage.URLOptions) (string, error) {
-	if err := storage.ValidateKey(key); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if err := storage.ValidateURLOptions(opts); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if err := ctx.Err(); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if s.urls == nil {
-		return "", storage.Wrap("url", key, storage.ErrUnsupported)
-	}
-	u, err := s.urls.URL(key, opts)
-	return u, storage.Wrap("url", key, err)
+	return presign.StoreURL(ctx, s.urls, key, opts)
+}
+
+var _ storage.DirectUploader = (*Store)(nil)
+
+// UploadURL implements storage.DirectUploader with the store's
+// presign.Signer (WithURLs): a signed PUT that presign.Handler stores.
+// Without a Signer it returns storage.ErrUnsupported (after validating its
+// arguments).
+func (s *Store) UploadURL(ctx context.Context, key string, opts storage.UploadURLOptions) (storage.UploadRequest, error) {
+	return presign.StoreUploadURL(ctx, s.urls, key, opts)
 }
 
 // Keys returns the stored keys, for tests that assert what was written.

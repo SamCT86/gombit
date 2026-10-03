@@ -68,6 +68,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -163,6 +166,12 @@ type bucketState struct {
 	err  error
 	keep bool
 }
+
+// MaxUploadURLBytes is the largest direct upload UploadURL grants: a
+// direct upload is one presigned PutObject, and S3's limit for a single
+// PUT is 5 GiB. (Put has no such limit: it uploads larger objects in
+// parts.)
+const MaxUploadURLBytes = 5 << 30
 
 // PartSize is the size of each multipart upload part, and the most a Put
 // holds in memory.
@@ -333,9 +342,16 @@ func (s *Store) put(ctx context.Context, key string, r io.Reader, opts storage.P
 	if contentType == "" {
 		contentType = storage.DefaultContentType
 	}
-	size, etag, err := s.upload(ctx, objKey, storage.PutReader(ctx, r, opts), opts.Size, contentType, encodeMetadata(opts.Metadata))
+	// IfAbsent is S3's conditional write: "If-None-Match: *" on the request
+	// that publishes the object (PutObject, or CompleteMultipartUpload),
+	// which S3 refuses with 412 where an object exists, atomically.
+	var ifNoneMatch *string
+	if opts.IfAbsent {
+		ifNoneMatch = aws.String("*")
+	}
+	size, etag, err := s.upload(ctx, objKey, storage.PutReader(ctx, r, opts), opts.Size, contentType, encodeMetadata(opts.Metadata), ifNoneMatch)
 	if err != nil {
-		return storage.ObjectInfo{}, classifyPut(ctx, err)
+		return storage.ObjectInfo{}, classifyPut(ctx, err, opts.IfAbsent)
 	}
 	return storage.ObjectInfo{
 		Key:         key,
@@ -348,7 +364,7 @@ func (s *Store) put(ctx context.Context, key string, r io.Reader, opts storage.P
 
 // upload stores body under objKey: one PutObject when it fits in a part, a
 // multipart upload otherwise. It returns the bytes stored and the ETag.
-func (s *Store) upload(ctx context.Context, objKey string, body io.Reader, declared *int64, contentType string, md map[string]string) (int64, string, error) {
+func (s *Store) upload(ctx context.Context, objKey string, body io.Reader, declared *int64, contentType string, md map[string]string, ifNoneMatch *string) (int64, string, error) {
 	bufSize := int64(PartSize)
 	if declared != nil && *declared < bufSize {
 		bufSize = *declared + 1 // room to see that the source ends there
@@ -370,6 +386,7 @@ func (s *Store) upload(ctx context.Context, objKey string, body io.Reader, decla
 			ContentLength: aws.Int64(int64(n)),
 			ContentType:   aws.String(contentType),
 			Metadata:      md,
+			IfNoneMatch:   ifNoneMatch,
 		}, singleAttempt)
 		if err != nil {
 			return 0, "", publishFailed(err, sent)
@@ -381,12 +398,12 @@ func (s *Store) upload(ctx context.Context, objKey string, body io.Reader, decla
 	// The buffer is full, so there may be more: go multipart. (A buffer
 	// sized to a declared size cannot fill: the size-checking reader fails
 	// the read that would put a byte past the size into it.)
-	return s.multipart(ctx, objKey, body, buf, contentType, md)
+	return s.multipart(ctx, objKey, body, buf, contentType, md, ifNoneMatch)
 }
 
 // multipart uploads buf (the first part, full) and the rest of body as
 // PartSize parts, aborting the upload if anything fails.
-func (s *Store) multipart(ctx context.Context, objKey string, body io.Reader, buf []byte, contentType string, md map[string]string) (_ int64, _ string, err error) {
+func (s *Store) multipart(ctx context.Context, objKey string, body io.Reader, buf []byte, contentType string, md map[string]string, ifNoneMatch *string) (_ int64, _ string, err error) {
 	created, err := s.client.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{
 		Bucket:      aws.String(s.bucket),
 		Key:         aws.String(objKey),
@@ -439,6 +456,7 @@ func (s *Store) multipart(ctx context.Context, objKey string, body io.Reader, bu
 		Key:             aws.String(objKey),
 		UploadId:        created.UploadId,
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+		IfNoneMatch:     ifNoneMatch,
 	}, singleAttempt)
 	if err != nil {
 		return 0, "", publishFailed(err, sent)
@@ -527,11 +545,36 @@ func publishFailed(err error, sent *attempts) error {
 	return &unknownOutcome{err: err}
 }
 
-// classifyPut classifies an upload's failure with classify, then adds what
-// the upload knows: that the outcome is unknown (storage.ErrUnknownOutcome),
-// and that a multipart upload could not be aborted (*AbortError). Neither
-// changes the classification of the failure itself.
-func classifyPut(ctx context.Context, err error) error {
+// conditionFailed classifies the failure of a conditional write
+// (IfAbsent): S3's 412 is storage.ErrExists (an object is there, and was
+// left as it was); a 409 ConditionalRequestConflict, a conflicting write
+// still in progress, is transient (storage.ErrUnavailable). It returns nil
+// for any other failure.
+func conditionFailed(err error) error {
+	var respErr *smithyhttp.ResponseError
+	if !errors.As(err, &respErr) {
+		return nil
+	}
+	switch respErr.HTTPStatusCode() {
+	case http.StatusPreconditionFailed:
+		return fmt.Errorf("%w: %v", storage.ErrExists, err)
+	case http.StatusConflict:
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "ConditionalRequestConflict" {
+			return errors.Join(storage.ErrUnavailable, err)
+		}
+	}
+	return nil
+}
+
+// classifyPut classifies an upload's failure: a conditional write's refusal
+// (ifAbsent: storage.ErrExists, or a transient conflict) with
+// conditionFailed, anything else with classify. It then adds what the
+// upload knows: that the outcome is unknown (storage.ErrUnknownOutcome),
+// and that a multipart upload could not be aborted (*AbortError), which a
+// refusal keeps too. Neither changes the classification of the failure
+// itself.
+func classifyPut(ctx context.Context, err error, ifAbsent bool) error {
 	var failed *abortFailed
 	var abort *AbortError
 	if errors.As(err, &failed) {
@@ -542,7 +585,13 @@ func classifyPut(ctx context.Context, err error) error {
 	if isUnknown {
 		err = unknown.err
 	}
-	out := classify(ctx, err)
+	var out error
+	if ifAbsent {
+		out = conditionFailed(err) // a conditional write's refusal, if it is one
+	}
+	if out == nil {
+		out = classify(ctx, err)
+	}
 	if isUnknown {
 		out = errors.Join(storage.ErrUnknownOutcome, out)
 	}
@@ -611,6 +660,27 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 	return storage.Wrap("delete", key, classify(ctx, err))
 }
 
+// presignedExpiry is when the presigned URL rawURL stops working, as S3
+// computes it: X-Amz-Date (whole seconds, the signing time) plus
+// X-Amz-Expires. Read from the URL itself, it is exactly what S3 enforces,
+// not a second clock reading that could fall in another second.
+func presignedExpiry(rawURL string) (time.Time, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return time.Time{}, err
+	}
+	q := u.Query()
+	date, err := time.Parse("20060102T150405Z", q.Get("X-Amz-Date"))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("s3 storage: presigned URL without a valid X-Amz-Date: %w", err)
+	}
+	secs, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
+	if err != nil || secs <= 0 {
+		return time.Time{}, fmt.Errorf("s3 storage: presigned URL without a valid X-Amz-Expires (%q)", q.Get("X-Amz-Expires"))
+	}
+	return date.Add(time.Duration(secs) * time.Second), nil
+}
+
 // URL implements storage.Storage. A public URL is PublicURL + "/" + the
 // escaped object key, for a key under PublicPrefix (storage.ErrNotPublic
 // otherwise; storage.ErrUnsupported without a PublicURL). A signed URL is a
@@ -648,6 +718,124 @@ func (s *Store) URL(ctx context.Context, key string, opts storage.URLOptions) (s
 		return "", storage.Wrap("url", key, classify(ctx, err))
 	}
 	return req.URL, nil
+}
+
+var _ storage.DirectUploader = (*Store)(nil)
+
+var _ storage.UploadVerifier = (*Store)(nil)
+
+// VerifyUpload implements storage.UploadVerifier. A grant signs the length,
+// type, metadata and If-None-Match of the PUT; SigV4 leaves other standard
+// headers unauthenticated, and S3 keeps five of them with the object and
+// serves them back: Cache-Control, Content-Disposition, Content-Encoding,
+// Content-Language and Expires. A grant never sets them, so an object that
+// has one was given it by the client: VerifyUpload fails with
+// storage.ErrInvalidOptions, naming them.
+func (s *Store) VerifyUpload(ctx context.Context, key string) error {
+	objKey, err := s.objectKey(key)
+	if err != nil {
+		return storage.Wrap("verify upload", key, err)
+	}
+	out, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(objKey)})
+	if err != nil {
+		return storage.Wrap("verify upload", key, classify(ctx, err))
+	}
+	var set []string
+	for name, value := range map[string]*string{
+		"Cache-Control":       out.CacheControl,
+		"Content-Disposition": out.ContentDisposition,
+		"Content-Encoding":    out.ContentEncoding,
+		"Content-Language":    out.ContentLanguage,
+		"Expires":             out.ExpiresString,
+	} {
+		if aws.ToString(value) != "" {
+			set = append(set, name)
+		}
+	}
+	if len(set) > 0 {
+		slices.Sort(set)
+		return storage.Wrap("verify upload", key, fmt.Errorf("%w: the upload set %s, which its grant does not allow", storage.ErrInvalidOptions, strings.Join(set, ", ")))
+	}
+	return nil
+}
+
+// UploadURL implements storage.DirectUploader: a presigned PutObject whose
+// signature covers the length, the content type, the metadata headers,
+// and "If-None-Match: *", so S3 refuses (403) a request that differs in
+// any of them, and (412) one to a key that already holds an object. The
+// client sends the returned headers; the bucket needs a CORS rule allowing
+// PUT from the app's origin for a browser to do so.
+func (s *Store) UploadURL(ctx context.Context, key string, opts storage.UploadURLOptions) (storage.UploadRequest, error) {
+	full, err := s.objectKey(key)
+	if err != nil {
+		return storage.UploadRequest{}, storage.Wrap("upload url", key, err)
+	}
+	if err := storage.ValidateUploadURLOptions(opts); err != nil {
+		return storage.UploadRequest{}, storage.Wrap("upload url", key, err)
+	}
+	if opts.Size > MaxUploadURLBytes {
+		// A direct upload is one presigned PutObject, and S3 refuses one
+		// over 5 GiB: a grant for more could never succeed.
+		return storage.UploadRequest{}, storage.Wrap("upload url", key, fmt.Errorf("%w: a direct upload to S3 is one PutObject, at most %d bytes (5 GiB), not %d", storage.ErrInvalidOptions, MaxUploadURLBytes, opts.Size))
+	}
+	if err := ctx.Err(); err != nil {
+		return storage.UploadRequest{}, storage.Wrap("upload url", key, err)
+	}
+	contentType := opts.ContentType
+	if contentType == "" {
+		contentType = storage.DefaultContentType
+	}
+	// The signature is dated after now (second precision): an expiry
+	// counted from now, truncated, is never later than S3's.
+	// The credentials the grant is signed with: temporary ones (an IAM
+	// role's, STS) end the URL when they expire, whatever its own expiry.
+	// Read before signing: if the cache refreshes them in between, the
+	// signature carries newer, later-expiring ones, so the Expires
+	// reported is never later than the real end.
+	var credsExpire time.Time
+	if provider := s.client.Options().Credentials; provider != nil {
+		creds, err := provider.Retrieve(ctx)
+		if err != nil {
+			return storage.UploadRequest{}, storage.Wrap("upload url", key, classify(ctx, err))
+		}
+		if creds.CanExpire {
+			credsExpire = creds.Expires
+		}
+	}
+	req, err := s.presign.PresignPutObject(ctx, &awss3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(full),
+		ContentType:   aws.String(contentType),
+		ContentLength: aws.Int64(opts.Size),
+		Metadata:      encodeMetadata(opts.Metadata),
+		// Single use: S3 stores it only where no object is (412
+		// otherwise), so an upload checked after it cannot be replaced.
+		IfNoneMatch: aws.String("*"),
+	}, awss3.WithPresignExpires(opts.Expires)) // whole seconds (URLOptions): X-Amz-Expires
+	if err != nil {
+		return storage.UploadRequest{}, storage.Wrap("upload url", key, classify(ctx, err))
+	}
+	expires, err := presignedExpiry(req.URL)
+	if err != nil {
+		return storage.UploadRequest{}, storage.Wrap("upload url", key, err)
+	}
+	if !credsExpire.IsZero() && credsExpire.Before(expires) {
+		expires = credsExpire // the credentials end first, and the URL with them
+	}
+	header := map[string]string{}
+	for name, values := range req.SignedHeader {
+		switch http.CanonicalHeaderKey(name) {
+		case "Host", "Content-Length": // set by the client's HTTP library
+			continue
+		}
+		header[http.CanonicalHeaderKey(name)] = strings.Join(values, ",")
+	}
+	return storage.UploadRequest{
+		Method:  req.Method,
+		URL:     req.URL,
+		Header:  header,
+		Expires: expires,
+	}, nil
 }
 
 // checkBucket returns notFound when the bucket exists, and a

@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -298,5 +299,175 @@ func TestStorageURLsServeRangesAndHEAD(t *testing.T) {
 	app.Router().ServeHTTP(w, req)
 	if etag == "" || w.Code != http.StatusNotModified {
 		t.Fatalf("conditional GET (ETag %q) = %d", etag, w.Code)
+	}
+}
+
+// TestStorageDirectUploadsThroughTheApp: the app's storage route stores a
+// direct upload made with the grant's request, and the route is exempt
+// from cookie-mode CSRF (the signed URL is the authorization).
+func TestStorageDirectUploadsThroughTheApp(t *testing.T) {
+	cfg := config.Default()
+	cfg.Storage.Driver = config.StorageDriverMemory
+	cfg.Storage.URLSecret = strings.Repeat("u", 32)
+	app := newTestApp(t, WithConfig(cfg))
+	ctx := context.Background()
+	req, err := storage.UploadURL(ctx, app.Storage(), "uploads/a.txt", storage.UploadURLOptions{Expires: time.Minute, Size: 5, ContentType: "text/plain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(req.Method, req.URL, strings.NewReader("hello"))
+	for k, v := range req.Header {
+		r.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	app.Router().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT = %d %s", w.Code, w.Body)
+	}
+	if info, err := app.Storage().Stat(ctx, "uploads/a.txt"); err != nil || info.Size != 5 {
+		t.Fatalf("Stat = %+v, %v", info, err)
+	}
+	if !app.storageRoute.owns(http.MethodPut, "/_storage/uploads/a.txt") || app.storageRoute.owns(http.MethodPut, "/_storagex/a") || app.storageRoute.owns(http.MethodPost, "/_storage/uploads/a.txt") {
+		t.Fatal("the middleware leaves alone something other than the mounted route's signed uploads")
+	}
+}
+
+// TestStorageRouteIsCSRFExemptInCookieMode: with cookie auth, a direct
+// upload to the storage route passes without a CSRF token, and any other
+// unsafe request still needs one.
+func TestStorageRouteIsCSRFExemptInCookieMode(t *testing.T) {
+	cfg := config.Default()
+	cfg.Environment = config.EnvironmentTest
+	cfg.Auth.JWTSecret = strings.Repeat("j", 32)
+	cfg.Auth.Mode = config.AuthModeCookie
+	router, route, err := newRouter(cfg, nil, nil, func(c *gin.Context) { c.Status(http.StatusOK) }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok := func(c *gin.Context) { c.Status(http.StatusOK) }
+	router.PUT("/_storage/*key", ok)
+	router.PUT("/api/things/:id", ok)
+	// Before the storage route is mounted, a route under its path is an
+	// ordinary route: CSRF applies.
+	put := func(path string) int {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(http.MethodPut, path, strings.NewReader("x")))
+		return w.Code
+	}
+	if got := put("/_storage/uploads/a"); got != http.StatusForbidden {
+		t.Fatalf("PUT under an unmounted storage path = %d, want 403: CSRF applies", got)
+	}
+	route.mounted("/_storage")
+	for path, want := range map[string]int{"/_storage/uploads/a": http.StatusOK, "/api/things/1": http.StatusForbidden} {
+		if got := put(path); got != want {
+			t.Errorf("PUT %s = %d, want %d", path, got, want)
+		}
+	}
+	if route.owns(http.MethodPut, "/_storagex/a") || route.owns(http.MethodPut, "/_storage") || route.owns(http.MethodPost, "/_storage/uploads/a") {
+		t.Fatal("the mounted route claims a request outside its signed uploads")
+	}
+}
+
+// TestWithStorageKeepsProtectionsUnderTheStoragePath: an app that brings
+// its own store (WithStorage) gets no framework storage route, so a route
+// it registers under GOMBIT_STORAGE_LOCAL_URL is an ordinary route: the
+// JSON body limit (and CSRF, and sanitization) still apply to it.
+func TestWithStorageKeepsProtectionsUnderTheStoragePath(t *testing.T) {
+	cfg := config.Default()
+	cfg.Storage.Driver = config.StorageDriverMemory
+	cfg.Storage.URLSecret = strings.Repeat("u", 32)
+	app := newTestApp(t, WithConfig(cfg), WithStorage(memory.New()))
+	app.Router().POST("/_storage/hook", func(c *gin.Context) {
+		var v map[string]any
+		if err := c.ShouldBindJSON(&v); err != nil {
+			c.Status(http.StatusBadRequest)
+			return
+		}
+		c.Status(http.StatusOK)
+	})
+	body := `{"pad":"` + strings.Repeat("x", int(maxRequestBodyBytes)) + `"}`
+	r := httptest.NewRequest(http.MethodPost, "/_storage/hook", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	app.Router().ServeHTTP(w, r)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("an oversized JSON POST to an app route under the storage path = %d, want 413: the body limit applies", w.Code)
+	}
+	if app.storageRoute.owns(http.MethodPost, "/_storage/hook") {
+		t.Fatal("WithStorage mounted no storage route, yet the middleware would leave its path alone")
+	}
+}
+
+// TestStorageRouteSkipsBodyRewritingMiddleware: a direct upload of a JSON
+// file larger than the JSON body limit, with input sanitization on, is
+// stored whole and unchanged.
+func TestStorageRouteSkipsBodyRewritingMiddleware(t *testing.T) {
+	cfg := config.Default()
+	cfg.Storage.Driver = config.StorageDriverMemory
+	cfg.Storage.URLSecret = strings.Repeat("u", 32)
+	cfg.Security.SanitizeInput = true
+	app := newTestApp(t, WithConfig(cfg))
+	ctx := context.Background()
+	doc := `{"note":"<b>kept</b>","pad":"` + strings.Repeat("x", int(maxRequestBodyBytes)) + `"}`
+	req, err := storage.UploadURL(ctx, app.Storage(), "uploads/doc.json", storage.UploadURLOptions{Expires: time.Minute, Size: int64(len(doc)), ContentType: "application/json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(req.Method, req.URL, strings.NewReader(doc))
+	for k, v := range req.Header {
+		r.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	app.Router().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT = %d %.200s", w.Code, w.Body)
+	}
+	body, _, err := app.Storage().Open(ctx, "uploads/doc.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = body.Close() }()
+	got, _ := io.ReadAll(body)
+	if string(got) != doc {
+		t.Fatalf("stored %d bytes, want the %d sent unchanged", len(got), len(doc))
+	}
+	// Elsewhere, the JSON limit still applies.
+	w = httptest.NewRecorder()
+	big := httptest.NewRequest(http.MethodPut, "/api/anything", strings.NewReader(doc))
+	big.Header.Set("Content-Type", "application/json")
+	app.Router().ServeHTTP(w, big)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a large JSON PUT elsewhere = %d, want 413", w.Code)
+	}
+}
+
+// TestAppRoutesUnderTheMountedStoragePathKeepProtections: with the
+// framework's storage route mounted, an application route under the same
+// path with another method (a POST hook) is application code, not a signed
+// upload: the JSON body limit still applies to it, while the route's own
+// signed PUTs stay exempt.
+func TestAppRoutesUnderTheMountedStoragePathKeepProtections(t *testing.T) {
+	cfg := config.Default()
+	cfg.Storage.Driver = config.StorageDriverMemory
+	cfg.Storage.URLSecret = strings.Repeat("u", 32)
+	app := newTestApp(t, WithConfig(cfg))
+	if !app.storageRoute.owns(http.MethodPut, "/_storage/x") {
+		t.Fatal("the storage route was not mounted")
+	}
+	app.Router().POST("/_storage/hook", func(c *gin.Context) {
+		var v map[string]any
+		if err := c.ShouldBindJSON(&v); err != nil {
+			c.Status(http.StatusBadRequest)
+			return
+		}
+		c.Status(http.StatusOK)
+	})
+	body := `{"pad":"` + strings.Repeat("x", int(maxRequestBodyBytes)) + `"}`
+	r := httptest.NewRequest(http.MethodPost, "/_storage/hook", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	app.Router().ServeHTTP(w, r)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("an oversized JSON POST to an app route under the mounted storage path = %d, want 413", w.Code)
 	}
 }
