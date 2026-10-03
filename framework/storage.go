@@ -5,8 +5,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -78,6 +80,7 @@ func openStorage(cfg config.Config, logger *zap.Logger) (storage.Storage, *presi
 			ForcePathStyle:  c.ForcePathStyle,
 			PublicPrefix:    cfg.Storage.PublicPrefix,
 			PublicURL:       c.PublicURL,
+			Warn:            func(msg string, err error) { logger.Warn(msg, zap.Error(err)) },
 		})
 		if err != nil {
 			return nil, nil, fmt.Errorf("framework: %w", err)
@@ -156,7 +159,7 @@ func checkStorageURLPath(path, apiPrefix string) error {
 // mountStorageURLs serves the objects of store at signer's URLs on router
 // (GET and HEAD under signer.Path()). A path the router cannot take (it
 // conflicts with a route already there) is an error, not a panic.
-func mountStorageURLs(router *gin.Engine, store storage.Storage, signer *presign.Signer) (err error) {
+func mountStorageURLs(router *gin.Engine, store storage.Storage, signer *presign.Signer, route *storageRoute) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("framework: GOMBIT_STORAGE_LOCAL_URL %q conflicts with a route: %v", signer.Path(), r)
@@ -165,5 +168,53 @@ func mountStorageURLs(router *gin.Engine, store storage.Storage, signer *presign
 	h := gin.WrapH(presign.Handler(store, signer))
 	router.GET(signer.Path()+"/*key", h)
 	router.HEAD(signer.Path()+"/*key", h)
+	router.PUT(signer.Path()+"/*key", h) // direct uploads
+	route.mounted(signer.Path())
 	return nil
+}
+
+// storageRoute is the storage route New mounted (presign.Handler, for
+// the local and memory drivers' URLs), if it mounted one. The runtime
+// middleware leaves its signed uploads alone, and nothing else: a PUT
+// under its path, which the route's catch-all owns outright (Gin refuses
+// any other PUT route there). Those uploads need it: CSRF (a direct upload
+// is authorized by its signed URL alone, with no cookie involved, as a
+// presigned S3 URL is), the JSON body limit (the signed length bounds it),
+// and input sanitization (the file is stored byte for byte). Ownership is
+// what New mounted, by method and path, not what the configuration names:
+// with WithStorage New mounts nothing, and a route an app registers under
+// GOMBIT_STORAGE_LOCAL_URL with another method (a POST hook, say) keeps
+// every protection.
+type storageRoute struct{ prefix atomic.Pointer[string] }
+
+// mounted records the path presign.Handler was mounted under (nothing for
+// an app that brought its own router and middleware: WithRouter).
+func (r *storageRoute) mounted(path string) {
+	if r == nil {
+		return
+	}
+	p := path + "/"
+	r.prefix.Store(&p)
+}
+
+// owns reports whether a request with method and path is a signed upload
+// to the mounted storage route: a PUT under its path.
+func (r *storageRoute) owns(method, path string) bool {
+	if r == nil || method != http.MethodPut {
+		return false
+	}
+	p := r.prefix.Load()
+	return p != nil && strings.HasPrefix(path, *p)
+}
+
+// skipStorageRoute runs h except for signed uploads to the mounted storage
+// route.
+func skipStorageRoute(route *storageRoute, h gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if route.owns(c.Request.Method, c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		h(c)
+	}
 }

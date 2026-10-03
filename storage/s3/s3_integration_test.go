@@ -3,6 +3,7 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/gombit-dev/gombit/storage"
 	"github.com/gombit-dev/gombit/storage/storagetest"
+	"github.com/gombit-dev/gombit/storage/upload"
 )
 
 // An S3-compatible integration target, for example a local MinIO:
@@ -331,5 +333,265 @@ func TestPublicURLs(t *testing.T) {
 	private := s.publicURL + "/" + storage.EscapeKey(s.prefix+"private/x.txt")
 	if code, _ := fetch(t, private); code != http.StatusForbidden {
 		t.Fatalf("GET a private object's would-be public URL = %d, want 403", code)
+	}
+}
+
+// TestDirectUploads: a grant from upload.Authorize uploads straight to the
+// bucket; S3 refuses any other length, type, or metadata; upload.Confirm
+// accepts what the grant allowed.
+func TestDirectUploads(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	png := append([]byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"), make([]byte, 100)...)
+	policy := upload.Policy{MaxBytes: 1 << 20, Types: []string{"image/png"}, Prefix: "avatars/"}
+	g, err := upload.Authorize(ctx, s, policy, int64(len(png)), "image/png", "résumé.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(body []byte, edit func(*http.Request)) int {
+		r, _ := http.NewRequest(g.Request.Method, g.Request.URL, bytes.NewReader(body))
+		for k, v := range g.Request.Header {
+			r.Header.Set(k, v)
+		}
+		if edit != nil {
+			edit(r)
+		}
+		resp, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := put(append(png, 0), nil); code != http.StatusForbidden {
+		t.Fatalf("a longer body = %d, want 403", code)
+	}
+	if code := put(png, func(r *http.Request) { r.Header.Set("Content-Type", "text/html") }); code != http.StatusForbidden {
+		t.Fatalf("another type = %d, want 403", code)
+	}
+	if code := put(png, func(r *http.Request) { r.Header.Set("X-Amz-Meta-Filename", "other.png") }); code != http.StatusForbidden {
+		t.Fatalf("other metadata = %d, want 403", code)
+	}
+	if ok, _ := storage.Exists(ctx, s, g.Key); ok {
+		t.Fatal("a refused upload was stored")
+	}
+	if code := put(png, nil); code != http.StatusOK {
+		t.Fatalf("the granted upload = %d", code)
+	}
+	f, err := upload.Confirm(ctx, s, g.Key, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Size != int64(len(png)) || f.ContentType != "image/png" || f.Filename != "résumé.png" {
+		t.Fatalf("confirmed %+v", f)
+	}
+	// The grant is spent: other bytes of the same length and type cannot
+	// replace the confirmed file.
+	other := bytes.Repeat([]byte("<"), len(png))
+	if code := put(other, nil); code != http.StatusPreconditionFailed {
+		t.Fatalf("replaying the grant = %d, want 412", code)
+	}
+	body, _, err := s.Open(ctx, g.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(body)
+	_ = body.Close()
+	if !bytes.Equal(got, png) {
+		t.Fatal("the confirmed file was replaced")
+	}
+	if !g.Request.Expires.After(time.Now()) || g.Request.Header["If-None-Match"] != "*" {
+		t.Fatalf("grant %+v", g.Request)
+	}
+}
+
+// stagingClaims is a minimal upload.Claimer: every key staged, promoted
+// once, held after.
+type stagingClaims struct{ staged, promoted map[string]bool }
+
+func (c *stagingClaims) Pending(context.Context, string, time.Time) error { return nil }
+func (c *stagingClaims) Stage(_ context.Context, key string, _ time.Time) error {
+	c.staged[key] = true
+	return nil
+}
+func (c *stagingClaims) Promote(_ context.Context, key string, _ time.Time) (bool, error) {
+	if !c.staged[key] || c.promoted[key] {
+		return false, nil
+	}
+	c.promoted[key] = true
+	return true, nil
+}
+func (c *stagingClaims) Publishing(context.Context, string, string) error { return nil }
+func (c *stagingClaims) Unpromote(_ context.Context, key string) error {
+	delete(c.promoted, key)
+	return nil
+}
+func (c *stagingClaims) Abandon(context.Context, string) (bool, error) { return false, nil }
+
+// TestStagedDirectUploads: under Policy.Claims, the presigned PUT goes to
+// the staging key; Confirm promotes it (a multipart upload whose part is
+// copied server-side: the bytes, type and metadata), and deletes the staged
+// copy. Replaying the grant afterwards,
+// as a late PUT would land, only ever writes the staging key again.
+func TestStagedDirectUploads(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	png := append([]byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"), make([]byte, 100)...)
+	policy := upload.Policy{MaxBytes: 1 << 20, Types: []string{"image/png"}, Prefix: "avatars/", Claims: &stagingClaims{staged: map[string]bool{}, promoted: map[string]bool{}}}
+	g, err := upload.Authorize(ctx, s, policy, int64(len(png)), "image/png", "résumé.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(body []byte) int {
+		r, _ := http.NewRequest(g.Request.Method, g.Request.URL, bytes.NewReader(body))
+		for k, v := range g.Request.Header {
+			r.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	exists := func(key string) bool {
+		ok, err := storage.Exists(ctx, s, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if code := put(png); code != http.StatusOK {
+		t.Fatalf("the granted upload = %d", code)
+	}
+	if exists(g.Key) || !exists(upload.StagingKey(g.Key)) {
+		t.Fatal("the grant did not upload to the staging key only")
+	}
+	f, err := upload.Confirm(ctx, s, g.Key, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := s.Stat(ctx, g.Key)
+	if err != nil || f.Key != g.Key || info.Size != int64(len(png)) || info.ContentType != "image/png" || info.StoredFilename() != "résumé.png" {
+		t.Fatalf("promoted %+v (%+v, %v)", f, info, err)
+	}
+	if exists(upload.StagingKey(g.Key)) {
+		t.Fatal("the staged copy was left")
+	}
+	if code := put(bytes.Repeat([]byte("<"), len(png))); code != http.StatusOK {
+		t.Fatalf("replaying the grant = %d", code)
+	}
+	body, _, err := s.Open(ctx, g.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(body)
+	_ = body.Close()
+	if !bytes.Equal(got, png) {
+		t.Fatal("a PUT with the grant changed the claimed key")
+	}
+}
+
+// TestListSkipsForeignKeys: an object under the store's prefix that is not
+// a valid storage key (written by another tool) is not listed, since no
+// method could act on it.
+func TestListSkipsForeignKeys(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if _, err := s.Put(ctx, "mine/a", strings.NewReader("x"), storage.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.client.PutObject(ctx, &awss3.PutObjectInput{Bucket: aws.String(*s3Bucket), Key: aws.String(s.prefix + "mine/dot./x"), Body: strings.NewReader("y")}); err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	if err := s.List(ctx, "mine/", func(o storage.ObjectInfo) error { keys = append(keys, o.Key); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 || keys[0] != "mine/a" {
+		t.Fatalf("List = %v, want only mine/a", keys)
+	}
+}
+
+// TestIfAbsentMultipart: IfAbsent holds for a multipart upload too: S3
+// refuses its CompleteMultipartUpload ("If-None-Match: *") where an object
+// exists, the Put fails with ErrExists, and the object stays as it was.
+func TestIfAbsentMultipart(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	key := "if-absent/large"
+	if _, err := s.Put(ctx, key, strings.NewReader("small original"), storage.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	large := io.LimitReader(rand.Reader, PartSize+1)
+	_, err := s.Put(ctx, key, large, storage.PutOptions{IfAbsent: true})
+	if !errors.Is(err, storage.ErrExists) || errors.Is(err, storage.ErrUnknownOutcome) {
+		t.Fatalf("a multipart IfAbsent Put on a held key = %v, want ErrExists", err)
+	}
+	body, info, err := s.Open(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = body.Close() }()
+	got, _ := io.ReadAll(body)
+	if string(got) != "small original" || info.Size != int64(len("small original")) {
+		t.Fatalf("the key holds %d bytes after the refused multipart Put, want the original", info.Size)
+	}
+	fresh := "if-absent/large-fresh"
+	if _, err := s.Put(ctx, fresh, io.LimitReader(rand.Reader, PartSize+1), storage.PutOptions{IfAbsent: true}); err != nil {
+		t.Fatalf("a multipart IfAbsent Put on an empty key = %v", err)
+	}
+}
+
+// TestConfirmRefusesHeadersTheGrantDidNotSet: SigV4 leaves standard
+// headers outside X-Amz-SignedHeaders unauthenticated, and S3 keeps five of
+// them with the object and serves them back. A grant holder who adds one to
+// an otherwise valid upload gets it stored; Confirm then refuses the
+// upload (ErrMalformed) and deletes it, so a confirmed object carries only
+// what its grant described.
+func TestConfirmRefusesHeadersTheGrantDidNotSet(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	png := append([]byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"), make([]byte, 100)...)
+	policy := upload.Policy{MaxBytes: 1 << 20, Types: []string{"image/png"}, Prefix: "avatars/"}
+	for header, value := range map[string]string{
+		"Cache-Control":       "public, max-age=31536000",
+		"Content-Disposition": "attachment; filename=evil.html",
+		"Content-Encoding":    "gzip",
+		"Content-Language":    "fr",
+		"Expires":             "Wed, 21 Oct 2037 07:28:00 GMT",
+	} {
+		t.Run(header, func(t *testing.T) {
+			g, err := upload.Authorize(ctx, s, policy, int64(len(png)), "image/png", "a.png")
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, _ := http.NewRequest(g.Request.Method, g.Request.URL, bytes.NewReader(png))
+			for k, v := range g.Request.Header {
+				r.Header.Set(k, v)
+			}
+			r.Header.Set(header, value)
+			resp, err := http.DefaultClient.Do(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Skipf("S3 refused the unsigned %s (%d): nothing to confirm", header, resp.StatusCode)
+			}
+			head, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(s.prefix + g.Key)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if aws.ToString(head.CacheControl)+aws.ToString(head.ContentDisposition)+aws.ToString(head.ContentEncoding)+aws.ToString(head.ContentLanguage)+aws.ToString(head.ExpiresString) == "" {
+				t.Fatalf("S3 did not keep the %s header: the test proves nothing", header)
+			}
+			if _, err := upload.Confirm(ctx, s, g.Key, policy); !errors.Is(err, upload.ErrMalformed) {
+				t.Fatalf("Confirm of an upload with an unsigned %s = %v, want ErrMalformed", header, err)
+			}
+			if ok, _ := storage.Exists(ctx, s, g.Key); ok {
+				t.Fatalf("the refused upload with %s was not deleted", header)
+			}
+		})
 	}
 }

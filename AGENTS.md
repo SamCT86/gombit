@@ -52,7 +52,15 @@ multipart) the drivers behind `framework.App.Storage()` (`GOMBIT_STORAGE_DRIVER`
 local by default), `storage/upload` the upload helpers (size limits,
 content-detected type policy, generated keys), and public and signed URLs
 (visibility by key prefix; presigned on S3, `storage/presign` HMAC URLs
-served at `/_storage` for local and memory). The other batteries
+served at `/_storage` for local and memory), and direct uploads
+(`storage.DirectUploader`, `upload.Authorize` / `upload.Confirm`), and
+cleanup semantics (`storage/claims`: a `storage_claims` table of
+pending/promoting/held/deleting keys moved by conditional updates, with
+leases and tombstones, so cleanup never deletes a file a record holds and
+no late upload leaves an orphan; direct uploads are staged under
+`_staging/` (a reserved namespace) and promoted by `upload.Confirm`
+with a fenceable `storage.PreparePublish`/`Publish`/`Fence`;
+`storage.Lister` enumerates objects). The other batteries
 (events, scheduler, mail, gRPC, multi-tenancy, i18n) are not here yet.
 The **CHAOS-0** resilience suite is in: `internal/faulttest` (deterministic
 fault injection: a faulting `database/sql` driver, a scripted HTTP

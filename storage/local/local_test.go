@@ -772,6 +772,40 @@ func TestSignedURLsInDevelopment(t *testing.T) {
 	}
 }
 
+func TestListEdgeCases(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if err := s.List(ctx, "", func(storage.ObjectInfo) error { t.Fatal("an empty store listed something"); return nil }); err != nil {
+		t.Fatalf("List before any Put = %v", err)
+	}
+	if _, err := s.Put(ctx, "a/b", strings.NewReader("x"), storage.PutOptions{ContentType: "text/plain", Metadata: map[string]string{"k": "v"}}); err != nil {
+		t.Fatal(err)
+	}
+	var got []storage.ObjectInfo
+	if err := s.List(ctx, "a/", func(o storage.ObjectInfo) error { got = append(got, o); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ContentType != "text/plain" || got[0].Metadata["k"] != "v" {
+		t.Fatalf("List = %+v, want the full ObjectInfo", got)
+	}
+	// A damaged object file is skipped and reported; the rest still list.
+	var warned []error
+	s, err := local.New(s.Root(), local.WithWarn(func(_ string, err error) { warned = append(warned, err) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Root(), "objects", "zz"), []byte("junk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	if err := s.List(ctx, "", func(storage.ObjectInfo) error { n++; return nil }); err != nil || n != 1 {
+		t.Fatalf("List over a damaged file = %v, %d objects; want the good one", err, n)
+	}
+	if len(warned) != 1 || !strings.Contains(warned[0].Error(), "corrupt") {
+		t.Fatalf("warnings = %v, want the damaged file reported", warned)
+	}
+}
+
 // TestOpenReaderSurvivesOverwriteAndDelete: a reader keeps the version it
 // opened while a Put replaces the object and a Delete removes it, as the
 // contract promises, on every platform (Windows included: the open file
@@ -827,6 +861,47 @@ func readAll(t *testing.T, s *local.Store, key string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// TestListDoesNotBlockWrites: a List reading an object's description does
+// not keep a concurrent Put or Delete of that object from proceeding (on
+// Windows, a file opened without delete sharing would).
+func TestListDoesNotBlockWrites(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if _, err := s.Put(ctx, "k", strings.NewReader("x"), storage.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	listed := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				listed <- nil
+				return
+			default:
+			}
+			if err := s.List(ctx, "", func(storage.ObjectInfo) error { return nil }); err != nil {
+				listed <- err
+				return
+			}
+		}
+	}()
+	for i := 0; i < 300; i++ {
+		if _, err := s.Put(ctx, "k", strings.NewReader("version"), storage.PutOptions{}); err != nil {
+			t.Fatalf("Put %d during a List = %v", i, err)
+		}
+		if i%3 == 0 {
+			if err := s.Delete(ctx, "k"); err != nil {
+				t.Fatalf("Delete %d during a List = %v", i, err)
+			}
+		}
+	}
+	close(stop)
+	if err := <-listed; err != nil {
+		t.Fatalf("List = %v", err)
+	}
 }
 
 // TestReadsDuringWritesSeeAVersionOrNothing: Open and Stat racing Puts and
@@ -1011,5 +1086,65 @@ func TestLongRoot(t *testing.T) {
 	other, _ := local.New(root) // its first Put sweeps, probing s's owner file
 	if _, err := other.Put(ctx, "k2", strings.NewReader("x"), storage.PutOptions{}); err != nil {
 		t.Fatalf("a second store's Put = %v", err)
+	}
+}
+
+// TestIfAbsentAcrossStores: IfAbsent is atomic for stores that share a
+// root (separate processes, say), not just within one store: of two stores
+// racing to create one key, exactly one succeeds.
+func TestIfAbsentAcrossStores(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root")
+	ctx := context.Background()
+	for round := 0; round < 20; round++ {
+		key := fmt.Sprintf("race/%d", round)
+		results := make(chan error, 2)
+		start := make(chan struct{})
+		for i := 0; i < 2; i++ {
+			s, _ := local.New(root)
+			body := fmt.Sprintf("store %d", i)
+			go func() {
+				<-start
+				_, err := s.Put(ctx, key, strings.NewReader(body), storage.PutOptions{IfAbsent: true})
+				results <- err
+			}()
+		}
+		close(start)
+		won := 0
+		for i := 0; i < 2; i++ {
+			switch err := <-results; {
+			case err == nil:
+				won++
+			case !errors.Is(err, storage.ErrExists):
+				t.Fatalf("round %d: Put = %v, want success or ErrExists", round, err)
+			}
+		}
+		if won != 1 {
+			t.Fatalf("round %d: %d of 2 stores created %q, want exactly one", round, won, key)
+		}
+	}
+}
+
+// TestLinkPublishThatCannotRemoveItsTempIsASuccess: the hard-link fallback
+// publishes the object when it links it; failing to remove the temporary
+// name afterwards does not make the Put a failure (the key holds the new
+// object, and a failure must leave it unchanged): Put succeeds and the
+// warning hook reports the stray file.
+func TestLinkPublishThatCannotRemoveItsTempIsASuccess(t *testing.T) {
+	var warned []error
+	s, _ := local.New(filepath.Join(t.TempDir(), "root"), local.WithWarn(func(_ string, err error) { warned = append(warned, err) }))
+	ctx := context.Background()
+	defer local.UseLinkPublish(func(string) error { return errors.New("remove: permission denied") })()
+	info, err := s.Put(ctx, "k", strings.NewReader("linked"), storage.PutOptions{IfAbsent: true})
+	if err != nil {
+		t.Fatalf("Put = %v; the object was published, so the Put succeeded", err)
+	}
+	if got := readAll(t, s, "k"); got != "linked" || info.Size != 6 {
+		t.Fatalf("the key holds %q (%d), want the new object", got, info.Size)
+	}
+	if len(warned) != 1 || !strings.Contains(warned[0].Error(), "temporary file") {
+		t.Fatalf("warnings = %v, want the stray temporary file reported", warned)
+	}
+	if _, err := s.Put(ctx, "k", strings.NewReader("again"), storage.PutOptions{IfAbsent: true}); !errors.Is(err, storage.ErrExists) {
+		t.Fatalf("a second IfAbsent Put through the link fallback = %v, want ErrExists", err)
 	}
 }

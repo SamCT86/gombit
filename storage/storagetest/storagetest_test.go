@@ -24,36 +24,116 @@ type fake struct {
 	mu      sync.Mutex
 	objects map[string]object
 
-	nonAtomic        bool // stores what it read so far even when the Put fails
-	noKeyCheck       bool // skips ValidateKey
-	ignoresSize      bool // skips PutOptions.Size
-	ignoresCtx       bool // never checks ctx while streaming
-	deleteMissingErr bool // Delete of a missing key is ErrNotFound
-	noDefaultType    bool // stores "" as the content type
-	emptyURL         bool // URL returns "", nil
-	dropsMetadata    bool // does not keep PutOptions.Metadata
-	keepsOldType     bool // an overwrite keeps the previous content type
-	deleteByPrefix   bool // Delete also removes keys under key + "/"
-	baseNameKey      bool // reports path.Base(key) as ObjectInfo.Key
-	truncates        bool // stores at most 1 MiB, reading the rest
-	rejectsEmpty     bool // refuses a zero-length object
-	noOptionsCheck   bool // skips ValidatePutOptions
-	tornWrites       bool // overwrites in place, only every other chunk
-	readIgnoresCtx   bool // Open/Stat/Delete/URL never check ctx
-	caseInsensitive  bool // keys are compared case-insensitively
-	urlNeedsObject   bool // URL returns ErrNotFound for a missing object
-	anyExpiry        bool // URL accepts a lifetime over MaxURLExpiry
-	signedNotPublic  bool // URL refuses a signed URL for a private object
-	bareErrors       bool // returns bare sentinels, not *storage.Error
-	aliasMetadata    bool // stores and returns one shared metadata map
-	openDetached     bool // Open's reader ignores the context once returned
-	nonAtomicFirst   bool // a key's first Put writes in place as it streams
-	resultIsInput    bool // Put's result carries the caller's metadata map
-	constantETag     bool // every version reports the same ETag
-	putNoETag        bool // Put reports no ETag (Open and Stat do)
-	openNoETag       bool // Open reports no ETag (Put and Stat do)
-	keepsForeignErr  bool // wraps like the old Wrap: keeps any *storage.Error
-	eofHidesCancel   bool // commits when the source's last read returns EOF after ctx ended
+	nonAtomic         bool // stores what it read so far even when the Put fails
+	noKeyCheck        bool // skips ValidateKey
+	ignoresSize       bool // skips PutOptions.Size
+	ignoresCtx        bool // never checks ctx while streaming
+	deleteMissingErr  bool // Delete of a missing key is ErrNotFound
+	noDefaultType     bool // stores "" as the content type
+	emptyURL          bool // URL returns "", nil
+	dropsMetadata     bool // does not keep PutOptions.Metadata
+	keepsOldType      bool // an overwrite keeps the previous content type
+	deleteByPrefix    bool // Delete also removes keys under key + "/"
+	baseNameKey       bool // reports path.Base(key) as ObjectInfo.Key
+	truncates         bool // stores at most 1 MiB, reading the rest
+	rejectsEmpty      bool // refuses a zero-length object
+	noOptionsCheck    bool // skips ValidatePutOptions
+	tornWrites        bool // overwrites in place, only every other chunk
+	readIgnoresCtx    bool // Open/Stat/Delete/URL never check ctx
+	caseInsensitive   bool // keys are compared case-insensitively
+	urlNeedsObject    bool // URL returns ErrNotFound for a missing object
+	anyExpiry         bool // URL accepts a lifetime over MaxURLExpiry
+	signedNotPublic   bool // URL refuses a signed URL for a private object
+	noUploadCheck     bool // UploadURL grants anything, valid or not
+	listByDir         bool // List("list/") also gives "listing" (a string prefix of the directory)
+	listSwallows      bool // List ignores fn's error and goes on
+	listStaleTime     bool // List reports the time of the listing, not of the object
+	bareErrors        bool // returns bare sentinels, not *storage.Error
+	aliasMetadata     bool // stores and returns one shared metadata map
+	openDetached      bool // Open's reader ignores the context once returned
+	nonAtomicFirst    bool // a key's first Put writes in place as it streams
+	resultIsInput     bool // Put's result carries the caller's metadata map
+	constantETag      bool // every version reports the same ETag
+	putNoETag         bool // Put reports no ETag (Open and Stat do)
+	openNoETag        bool // Open reports no ETag (Put and Stat do)
+	keepsForeignErr   bool // wraps like the old Wrap: keeps any *storage.Error
+	eofHidesCancel    bool // commits when the source's last read returns EOF after ctx ended
+	ignoresIfAbsent   bool // PutOptions.IfAbsent overwrites anyway
+	racyIfAbsent      bool // IfAbsent checks before reading the source, stores after
+	publishEarly      bool // PreparePublish publishes at once
+	publishDropsMeta  bool // Publish loses the source's metadata
+	publishOverwrites bool // Publish replaces an object at dst
+	fenceNoop         bool // Fence does not stop a later Publish
+	pubs              []*publication
+}
+
+// publication is a fake prepared copy.
+type publication struct {
+	src, dst         string
+	fenced, finished bool
+}
+
+// PreparePublish implements storage.Publisher (the fake copies within its
+// map when Publish is called).
+func (f *fake) PreparePublish(ctx context.Context, src, dst string) (string, error) {
+	if err := f.checkKey(dst); err != nil {
+		return "", f.wrap("publish", dst, err)
+	}
+	if _, err := f.get("publish", src); err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	f.pubs = append(f.pubs, &publication{src: src, dst: dst})
+	token := fmt.Sprint(len(f.pubs) - 1)
+	f.mu.Unlock()
+	if f.publishEarly {
+		if _, err := f.Publish(ctx, token); err != nil {
+			return "", err
+		}
+	}
+	return token, nil
+}
+
+func (f *fake) pub(token string) *publication {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var i int
+	_, _ = fmt.Sscan(token, &i)
+	return f.pubs[i]
+}
+
+// Publish implements storage.Publisher.
+func (f *fake) Publish(ctx context.Context, token string) (storage.ObjectInfo, error) {
+	p := f.pub(token)
+	if p.finished {
+		return storage.ObjectInfo{}, f.wrap("publish", p.dst, storage.ErrUnavailable)
+	}
+	if p.fenced && !f.fenceNoop {
+		return storage.ObjectInfo{}, f.wrap("publish", p.dst, storage.ErrUnavailable)
+	}
+	o, err := f.get("publish", p.src)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	info := o.info
+	info.Key = p.dst
+	if f.publishDropsMeta {
+		info.Metadata = nil
+	}
+	if f.publishOverwrites {
+		f.store(p.dst, o.data, info)
+	} else if !f.storeIfAbsent(p.dst, o.data, info) {
+		return storage.ObjectInfo{}, f.wrap("publish", p.dst, storage.ErrExists)
+	}
+	p.finished = true
+	info.Size = int64(len(o.data))
+	return f.owned(info), nil
+}
+
+// Fence implements storage.Publisher.
+func (f *fake) Fence(_ context.Context, token string) error {
+	f.pub(token).fenced = true
+	return nil
 }
 
 type object struct {
@@ -94,6 +174,11 @@ func (f *fake) Put(ctx context.Context, key string, r io.Reader, opts storage.Pu
 		info.Metadata = make(map[string]string, len(opts.Metadata))
 		for k, v := range opts.Metadata {
 			info.Metadata[k] = v
+		}
+	}
+	if opts.IfAbsent && f.racyIfAbsent {
+		if _, taken := f.lookup(key); taken {
+			return storage.ObjectInfo{}, f.wrap("put", key, storage.ErrExists)
 		}
 	}
 	var buf bytes.Buffer
@@ -142,7 +227,13 @@ func (f *fake) Put(ctx context.Context, key string, r io.Reader, opts storage.Pu
 	if f.constantETag {
 		info.ETag = "constant"
 	}
-	f.store(key, data, info)
+	if opts.IfAbsent && !f.ignoresIfAbsent && !f.racyIfAbsent {
+		if !f.storeIfAbsent(key, data, info) {
+			return storage.ObjectInfo{}, f.wrap("put", key, storage.ErrExists)
+		}
+	} else {
+		f.store(key, data, info)
+	}
 	if f.aliasMetadata {
 		o, _ := f.lookup(key)
 		return o.info, nil
@@ -218,6 +309,19 @@ func (f *fake) store(key string, data []byte, info storage.ObjectInfo) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.objects[f.mapKey(key)] = object{data: append([]byte(nil), data...), info: f.owned(info)}
+}
+
+// storeIfAbsent stores data under key only if nothing is stored there,
+// checking and storing under one lock.
+func (f *fake) storeIfAbsent(key string, data []byte, info storage.ObjectInfo) bool {
+	info.Size = int64(len(data))
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, taken := f.objects[f.mapKey(key)]; taken {
+		return false
+	}
+	f.objects[f.mapKey(key)] = object{data: append([]byte(nil), data...), info: f.owned(info)}
+	return true
 }
 
 // lookup reports whether key holds an object.
@@ -328,6 +432,47 @@ func (f *fake) URL(ctx context.Context, key string, opts storage.URLOptions) (st
 	return "", f.wrap("url", key, storage.ErrUnsupported)
 }
 
+func (f *fake) UploadURL(ctx context.Context, key string, opts storage.UploadURLOptions) (storage.UploadRequest, error) {
+	if f.noUploadCheck {
+		return storage.UploadRequest{Method: "PUT", URL: "https://example.com/" + key, Expires: time.Now().Add(opts.Expires)}, nil
+	}
+	if err := f.checkKey(key); err != nil {
+		return storage.UploadRequest{}, f.wrap("upload url", key, err)
+	}
+	if err := storage.ValidateUploadURLOptions(opts); err != nil {
+		return storage.UploadRequest{}, f.wrap("upload url", key, err)
+	}
+	return storage.UploadRequest{Method: "PUT", URL: "https://example.com/" + key, Expires: time.Now().Add(opts.Expires)}, nil
+}
+
+func (f *fake) List(ctx context.Context, prefix string, fn func(storage.ObjectInfo) error) error {
+	if err := f.readCtx(ctx); err != nil {
+		return f.wrap("list", prefix, err)
+	}
+	f.mu.Lock()
+	var infos []storage.ObjectInfo
+	for k, o := range f.objects {
+		match := strings.HasPrefix(k, prefix)
+		if f.listByDir {
+			match = strings.HasPrefix(k, strings.TrimSuffix(prefix, "/"))
+		}
+		if match {
+			info := o.info
+			if f.listStaleTime {
+				info.ModTime = time.Now().Add(time.Hour)
+			}
+			infos = append(infos, info)
+		}
+	}
+	f.mu.Unlock()
+	for _, info := range infos {
+		if err := fn(info); err != nil && !f.listSwallows {
+			return err
+		}
+	}
+	return nil
+}
+
 func TestReferenceFakePasses(t *testing.T) {
 	Run(t, func(*testing.T) storage.Storage { return newFake() })
 }
@@ -412,6 +557,7 @@ func TestSuiteCatchesBrokenDrivers(t *testing.T) {
 		{"NoPartialReads", func(f *fake) { f.nonAtomic = true }, "part of the object being written"},
 		{"InvalidOptions", func(f *fake) { f.anyExpiry = true }, "MaxURLExpiry"},
 		{"URL", func(f *fake) { f.signedNotPublic = true }, "a signed URL works for a private object"},
+		{"DirectUpload", func(f *fake) { f.noUploadCheck = true }, "want storage: invalid object key"},
 		{"NoPartialReads", func(f *fake) { f.nonAtomicFirst = true }, "mid-Put of a new key"},
 		{"MetadataIsOwned", func(f *fake) { f.aliasMetadata = true }, "the stored metadata changed without a Put"},
 		{"MetadataIsOwned", func(f *fake) { f.resultIsInput = true }, "shares the caller's map"},
@@ -421,8 +567,17 @@ func TestSuiteCatchesBrokenDrivers(t *testing.T) {
 		{"FailedPutKeepsPrevious", func(f *fake) { f.keepsForeignErr = true }, "inside a *storage.Error"},
 		{"CanceledPut", func(f *fake) { f.eofHidesCancel = true }, "want context canceled"},
 		{"OpenFollowsContext", func(f *fake) { f.openDetached = true }, "must follow the context"},
+		{"IfAbsent", func(f *fake) { f.ignoresIfAbsent = true }, "want storage: an object is already stored"},
+		{"IfAbsent", func(f *fake) { f.racyIfAbsent = true }, "want exactly one"},
 		{"Missing", func(f *fake) { f.bareErrors = true }, "inside a *storage.Error"},
 		{"InvalidKeys", func(f *fake) { f.bareErrors = true }, "inside a *storage.Error"},
+		{"List", func(f *fake) { f.listByDir = true }, "want exactly list/a"},
+		{"List", func(f *fake) { f.listSwallows = true }, "want fn's error after 1"},
+		{"List", func(f *fake) { f.listStaleTime = true }, "callers decide on these"},
+		{"Publish", func(f *fake) { f.publishEarly = true }, "PreparePublish published already"},
+		{"Publish", func(f *fake) { f.publishDropsMeta = true }, "want the source's bytes, type and metadata"},
+		{"Publish", func(f *fake) { f.publishOverwrites = true }, "want storage: an object is already stored"},
+		{"Publish", func(f *fake) { f.fenceNoop = true }, "a fenced copy was published"},
 	}
 	covered := map[string]bool{}
 	for _, tc := range cases {

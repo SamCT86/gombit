@@ -171,6 +171,13 @@ func New(root string, opts ...Option) (*Store, error) {
 
 var _ storage.Storage = (*Store)(nil)
 
+var _ storage.BoundedWriter = (*Store)(nil)
+
+// BoundedWrites implements storage.BoundedWriter: a Put publishes with one
+// rename after checking its context, within the call, so nothing it wrote
+// is published after it returns.
+func (*Store) BoundedWrites() {}
+
 // Root returns the absolute root directory.
 func (s *Store) Root() string { return s.root }
 
@@ -275,7 +282,24 @@ func (s *Store) put(ctx context.Context, key string, r io.Reader, opts storage.P
 	if err := s.ensureDir(filepath.Dir(dst)); err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	if err := replaceFile(tmp.Name(), dst); err != nil {
+	// IfAbsent publishes with a rename that refuses to replace: the check
+	// and the store are one step, for every process sharing the root.
+	publish := replaceFile
+	if opts.IfAbsent {
+		publish = renameNoReplaceHook
+	}
+	var leftover *leftoverError
+	if err := publish(tmp.Name(), dst); errors.As(err, &leftover) {
+		// Published (a hard link): only the temporary name remains, in this
+		// store's work directory. The Put has happened; say so, and let the
+		// warning hook report the stray file.
+		if s.warn != nil {
+			s.warn("local storage: an object was stored, but its temporary file could not be removed", leftover)
+		}
+	} else if err != nil {
+		if opts.IfAbsent && errors.Is(err, fs.ErrExist) {
+			return storage.ObjectInfo{}, storage.ErrExists
+		}
 		return storage.ObjectInfo{}, err
 	}
 	// The rename published the object: from here the Put has happened, and
@@ -610,6 +634,65 @@ type objectReader struct {
 
 func (r *objectReader) Close() error { return r.f.Close() }
 
+var _ storage.Lister = (*Store)(nil)
+
+// List implements storage.Lister. Objects are stored by the hash of their
+// key, so it reads every object file's trailer: its cost is the whole
+// store, whatever the prefix. A damaged file (one that is not a readable
+// object) is skipped and reported to WithWarn, so one bad file does not
+// stop every cleanup that lists.
+func (s *Store) List(ctx context.Context, prefix string, fn func(storage.ObjectInfo) error) error {
+	err := filepath.WalkDir(filepath.Join(s.root, "objects"), func(path string, d fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // no objects yet, or a directory removed meanwhile
+		}
+		if err != nil {
+			return err
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		f, err := openShared(path) // a regular file (never a symlink: d.Type) under the store's own root, which only the store writes; shared, so a concurrent Put or Delete of it proceeds
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // deleted meanwhile
+		}
+		if err != nil {
+			return err
+		}
+		size, h, err := readTrailer(f)
+		_ = f.Close()
+		if errors.Is(err, errCorrupt) {
+			if s.warn != nil {
+				s.warn("local storage: skipping a damaged object file while listing", err)
+			}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(h.Key, prefix) {
+			return nil
+		}
+		if err := fn(h.info(size)); err != nil {
+			return fnError{err}
+		}
+		return nil
+	})
+	var fe fnError
+	if errors.As(err, &fe) {
+		return fe.err // fn's own error, as it returned it
+	}
+	return storage.Wrap("list", prefix, err)
+}
+
+// fnError carries the error of List's callback through the walk.
+type fnError struct{ err error }
+
+func (e fnError) Error() string { return e.err.Error() }
+
 // Stat implements storage.Storage.
 func (s *Store) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
 	f, size, h, err := s.open(ctx, key)
@@ -647,18 +730,15 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 // one. Without a Signer it returns storage.ErrUnsupported (after
 // validating its arguments).
 func (s *Store) URL(ctx context.Context, key string, opts storage.URLOptions) (string, error) {
-	if err := storage.ValidateKey(key); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if err := storage.ValidateURLOptions(opts); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if err := ctx.Err(); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if s.urls == nil {
-		return "", storage.Wrap("url", key, storage.ErrUnsupported)
-	}
-	u, err := s.urls.URL(key, opts)
-	return u, storage.Wrap("url", key, err)
+	return presign.StoreURL(ctx, s.urls, key, opts)
+}
+
+var _ storage.DirectUploader = (*Store)(nil)
+
+// UploadURL implements storage.DirectUploader with the store's
+// presign.Signer (WithURLs): a signed PUT that presign.Handler stores.
+// Without a Signer it returns storage.ErrUnsupported (after validating its
+// arguments).
+func (s *Store) UploadURL(ctx context.Context, key string, opts storage.UploadURLOptions) (storage.UploadRequest, error) {
+	return presign.StoreUploadURL(ctx, s.urls, key, opts)
 }

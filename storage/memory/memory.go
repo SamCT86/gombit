@@ -12,6 +12,8 @@ import (
 	"encoding/hex"
 	"io"
 	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +62,12 @@ func New(opts ...Option) *Store {
 
 var _ storage.Storage = (*Store)(nil)
 
+var _ storage.BoundedWriter = (*Store)(nil)
+
+// BoundedWrites implements storage.BoundedWriter: a Put publishes in the
+// process, after checking its context, within the call.
+func (*Store) BoundedWrites() {}
+
 // reader is an object's bytes, seekable (for Range requests).
 type reader struct{ *bytes.Reader }
 
@@ -101,8 +109,11 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader, opts storage.P
 		info.Metadata = nil
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, taken := s.objects[key]; taken && opts.IfAbsent {
+		return storage.ObjectInfo{}, storage.Wrap("put", key, storage.ErrExists) // checked and stored under one lock
+	}
 	s.objects[key] = object{data: data, info: info}
-	s.mu.Unlock()
 	return copyInfo(info), nil
 }
 
@@ -159,20 +170,17 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 // one. Without a Signer it returns storage.ErrUnsupported (after
 // validating its arguments).
 func (s *Store) URL(ctx context.Context, key string, opts storage.URLOptions) (string, error) {
-	if err := storage.ValidateKey(key); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if err := storage.ValidateURLOptions(opts); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if err := ctx.Err(); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if s.urls == nil {
-		return "", storage.Wrap("url", key, storage.ErrUnsupported)
-	}
-	u, err := s.urls.URL(key, opts)
-	return u, storage.Wrap("url", key, err)
+	return presign.StoreURL(ctx, s.urls, key, opts)
+}
+
+var _ storage.DirectUploader = (*Store)(nil)
+
+// UploadURL implements storage.DirectUploader with the store's
+// presign.Signer (WithURLs): a signed PUT that presign.Handler stores.
+// Without a Signer it returns storage.ErrUnsupported (after validating its
+// arguments).
+func (s *Store) UploadURL(ctx context.Context, key string, opts storage.UploadURLOptions) (storage.UploadRequest, error) {
+	return presign.StoreUploadURL(ctx, s.urls, key, opts)
 }
 
 // Keys returns the stored keys, for tests that assert what was written.
@@ -192,4 +200,32 @@ func (s *Store) Keys() []string {
 func copyInfo(info storage.ObjectInfo) storage.ObjectInfo {
 	info.Metadata = maps.Clone(info.Metadata)
 	return info
+}
+
+var _ storage.Lister = (*Store)(nil)
+
+// List implements storage.Lister, in key order, over a snapshot taken
+// when it starts (fn may delete).
+func (s *Store) List(ctx context.Context, prefix string, fn func(storage.ObjectInfo) error) error {
+	if err := ctx.Err(); err != nil {
+		return storage.Wrap("list", prefix, err)
+	}
+	s.mu.RLock()
+	var infos []storage.ObjectInfo
+	for k, o := range s.objects {
+		if strings.HasPrefix(k, prefix) {
+			infos = append(infos, copyInfo(o.info))
+		}
+	}
+	s.mu.RUnlock()
+	slices.SortFunc(infos, func(a, b storage.ObjectInfo) int { return strings.Compare(a.Key, b.Key) })
+	for _, info := range infos {
+		if err := ctx.Err(); err != nil {
+			return storage.Wrap("list", prefix, err)
+		}
+		if err := fn(info); err != nil {
+			return err
+		}
+	}
+	return nil
 }

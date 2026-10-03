@@ -7,8 +7,8 @@ call, so moving from local development to S3-compatible storage in
 production changes configuration, not code.
 
 > **Status:** the contract, the local, in-memory, and S3-compatible
-> drivers, the upload helpers, and public and signed URLs. Direct uploads
-> and admin fields follow
+> drivers, the upload helpers, public and signed URLs, direct uploads, and
+> metadata and cleanup semantics. Admin fields follow
 > ([epic #279](https://github.com/gombit-dev/gombit/issues/279)).
 
 Every app has a store: `app.Storage()` returns the driver `GOMBIT_STORAGE_DRIVER`
@@ -53,7 +53,7 @@ err = store.Delete(ctx, "avatars/42.png")
 | --- | --- |
 | **Streaming** | `Put` reads an `io.Reader` to EOF in pieces, and `Open` returns an `io.ReadCloser`. Neither needs the whole object in memory, a seekable source, or a known length. |
 | **Atomic writes** | A `Put` that fails leaves the key as it was: the previous object whole, or still absent. That covers the reader returning an error, the context ending, and a length that differs from the declared `Size`. A reader during a `Put` reads the previous object whole, never part of the new one; for a key stored for the first time, it finds no object until the `Put` completes. Concurrent `Put`s to one key leave one of them whole. The one exception is a failure that matches `ErrUnknownOutcome`: a remote backend (S3) was sent the object and never said whether it stored it, because the answer was lost, the connection dropped, or the service failed. The key then holds the previous object or the new one, whole; which is unknown. `Stat` the key, or `Put` again (repeating a `Put` is safe). The local and memory drivers never return it. |
-| **Overwrite** | `Put` replaces an existing object, including its content type and metadata. |
+| **Overwrite** | `Put` replaces an existing object, including its content type and metadata. With `PutOptions{IfAbsent: true}` it stores only where nothing is stored, and otherwise fails with `ErrExists` and leaves the object. The check and the store are one atomic step on every driver, against other processes sharing the backend too: the local driver publishes with a rename that refuses to replace, and S3 with a conditional write (`If-None-Match: *`). Of two `IfAbsent` `Put`s to one empty key, exactly one succeeds. |
 | **Idempotent delete** | Deleting a missing object is not an error, so a retried delete is safe. |
 | **Portable keys** | Every method validates its key with the same rule (below) and fails with `ErrInvalidKey` before touching the backend. Every valid key is its own object on every driver: keys that differ only in case or in Unicode normalization (`café` NFC and NFD), a key that is a prefix of another (`a` and `a/b`), segments up to 255 bytes, and names Windows reserves (`CON`, `c:`) all store and read back as themselves. |
 | **Context** | Every method honors `ctx`: one that has already ended fails the call with the context's error. A `Put` canceled mid-stream fails the same way and stores nothing. `Put` observes the context between reads of its source: it cannot interrupt a source `Read` already blocked, since an `io.Reader` has no way to be interrupted. The source's owner makes it return, as an HTTP server closes a request body when the client goes away. Once the context has ended, the `Put` fails even if the source then reaches EOF. The reader `Open` returns stays bound to its `ctx` until it is closed: once the context ends, reading fails with its error and a read blocked in the backend returns, the way an HTTP response body does. `storage.ContextReadCloser` gives other drivers that behavior over a reader whose `Close` interrupts a `Read` (a file, an HTTP body, a pipe). Keep the context alive while the stream is read. |
@@ -187,6 +187,231 @@ An app that passes its own store with `framework.WithStorage` builds a
 `presign.Signer`, passes it to `local.WithURLs` or `memory.WithURLs`, and
 mounts `presign.Handler` itself.
 
+## Metadata and lifecycle
+
+### What an object says about itself
+
+`Stat` (and `Open`) return an `ObjectInfo`:
+
+| Field | Meaning |
+| --- | --- |
+| `Key` | The object's key. |
+| `Size` | Its length in bytes. |
+| `ContentType` | Its media type (for an upload, the detected or confirmed type). |
+| `ETag` | An opaque version identifier, which changes when the bytes change. Compare ETags; never compute or interpret one. On S3 its form depends on how the object was uploaded and on the bucket's encryption (SSE-KMS, say), so it is not a checksum of the bytes. |
+| `ModTime` | When it was last stored. For an upload under a generated key, which is written once, that is when it was created. |
+| `Metadata`, `StoredFilename()` | The user metadata. `StoredFilename()` is the client's cleaned filename (the `filename` metadata) that `storage/upload` stores; an `upload.File` has it as its `Filename` field. |
+
+### Cleanup
+
+A file and the database record that refers to it are two writes in two
+systems, with no shared transaction. Neither "the insert returned an error"
+nor "no record refers to it right now" proves a file is unreferenced: an
+insert can commit and lose its answer (a dropped connection), and a record
+can be written a moment after the check. Deleting on either evidence can
+delete the file of a live record.
+
+`storage/claims` closes that gap by making the database the authority on
+who owns a file. It keeps a table, `storage_claims`, with one row per key
+under the protocol, in one of three states:
+
+| State | Meaning |
+| --- | --- |
+| `pending` | Stored (or about to be), and no record refers to it yet. |
+| `held` | A record refers to it. A held file is never deleted. |
+| `deleting` | Being deleted. No record can take it. |
+
+Every transition is one conditional `UPDATE`, so two that race on a key
+(a record taking it and a sweep abandoning it, say) cannot both win, in
+any number of processes. Storage drivers know nothing of claims:
+`storage.Storage` stays objects only.
+
+**Setup.** Add the table to the application's migrations
+(`claims.Models()`; apps made by `gombit new` have it), build a `Claims`
+over the database and the store, and give it to upload policies:
+
+```go
+cl := claims.New(db, app.Storage(), claims.WithWarn(logWarning))
+avatars.Claims = cl // upload.Policy: each generated key is claimed first
+```
+
+`upload.Receive` and `upload.Authorize` then claim each key (`pending`)
+before anything is stored under it. A key that cannot be claimed fails the
+upload, and nothing is stored. A claim holds keys of at most
+`claims.MaxKeyLen` (512) bytes, so keep `Policy.Prefix` under 480. Under
+`Policy.Claims`, a file that fails (an invalid request, a refused
+`Confirm`) is deleted through the protocol: only while its key is
+`pending`. A refused confirmation of a key a record holds, or of a key
+never claimed, deletes nothing.
+
+**Recording an upload.** Write the record with `CreateWith`. It runs your
+insert in a transaction that also moves the key from `pending` to `held`,
+so the record and the hold commit together or not at all:
+
+```go
+f, err := upload.Receive(store, r, avatars)
+// ...
+err = cl.CreateWith(ctx, []string{f.Key}, func(tx *gorm.DB) error {
+	return tx.Create(&Avatar{UserID: user.ID, FileKey: f.Key}).Error
+})
+```
+
+When the transaction fails, `CreateWith` abandons the upload: it moves the
+key from `pending` to `deleting`, deletes the file, then the claim. If the
+transaction in fact committed although it returned an error, or another
+request already recorded the key (a retried confirmation), the key is
+`held`. Abandoning it then does nothing, and the file is kept. A key that
+is not `pending` fails the transaction with `claims.ErrNotPending`.
+
+A record with several files passes all their keys; empty keys (an
+optional file left out) are skipped.
+
+**Replacing a file.** Use `Update(ctx, hold, release, fn)`. Your change,
+the new keys' moves to `held`, and the old keys' moves to `deleting`
+commit in one transaction. If it fails, the new uploads are abandoned and
+the old files kept; once it commits, the old files are deleted. A key in
+both lists (a file kept) is left alone.
+
+**Deleting a record.** Use `DeleteWith`. Your delete and the keys' moves
+from `held` to `deleting` commit in one transaction, and then the files are
+deleted. If deleting the file fails, the record is still gone: the warning
+hook is told, and the next sweep finishes the delete. A key with no claim
+(a file stored before the application adopted claims, or no file at all)
+is outside the protocol: the record is deleted and the file is left alone.
+A claim that is `pending` or `deleting` is not the record's to release:
+`DeleteWith` fails with `claims.ErrNotHeld` and the record is kept.
+
+**Abandoned uploads.** Some uploads are never recorded: a direct upload
+granted but never confirmed, or a crash between storing a file and writing
+its record. Their claims stay `pending`. Run `cl.Sweep(ctx, grace)`
+periodically, as a job. It abandons every `pending` claim older than
+`grace` and finishes every `deleting` one. Set `grace` longer than an
+upload can take to be recorded: more than `Policy.GrantExpiry` plus the
+confirmation, for direct uploads (the example uses twice
+`upload.DefaultGrantExpiry`).
+
+**Uploads still writing.** A claim comes before its file, so a sweep can
+abandon the claim of an upload that is still streaming, and the upload can
+then publish its file. To keep that file from becoming an orphan no sweep
+can find, every claim has a **lease**: the time after which no writer the
+application controls publishes under its key any more.
+
+- `upload.Save` and `upload.Receive` lease the key for
+  `Policy.UploadTimeout` (`upload.DefaultUploadTimeout`, an hour, when zero)
+  and run the `Put` under that deadline. A body read already in progress is
+  not interrupted, but the drivers check the deadline just before they
+  publish, so a `Put` still running then never stores anything.
+- A `deleting` claim (abandoned, swept, or released by a record's delete)
+  stays as a **tombstone** until its lease, plus `claims.LeaseMargin` (5
+  minutes, for clocks that disagree and a publish already sent), has ended.
+  Each sweep deletes its file again, so a file published late is still
+  deleted, and no record can hold the key. Only then is the row removed.
+
+**Direct uploads are staged.** The application cannot end a direct upload:
+S3 checks a presigned URL's expiry when the `PUT` starts, and a `PUT`
+started in time can publish whenever it ends. So under claims a client
+never writes a claimed key:
+
+1. `upload.Authorize` claims the key as staged (`claims.Stage`) and grants
+   a `PUT` to its staging key, `upload.StagingKey(key)`: `_staging/` and the
+   key. The grant's `Key` is still the key, which the client submits.
+2. `upload.Confirm` moves the claim to `promoting` (`claims.Promote`, which
+   one confirmation wins), checks the staged object, publishes a copy of it
+   at the key, and deletes the staged copy. Only then can a record hold the
+   key; a staged claim that was never promoted cannot be held.
+3. A refused staged object is deleted and the claim goes back to `pending`,
+   so the grant can upload again.
+
+**Promotion is fenced.** On S3 the copy to the key is a remote request
+too: once S3 has accepted it, no deadline on the application's side proves
+it will not complete later. So it is published in two steps
+(`storage.Publisher`):
+
+1. `storage.PreparePublish` creates a multipart upload of the key and
+   copies the staged object into its parts server-side (`UploadPartCopy`,
+   in ranges for objects over 5 GiB, at most 1,100 parts). This publishes
+   nothing. The token records each part's ETag as S3 returned it: the
+   manifest the upload is completed with (AWS forbids completing from a
+   listing). ETags are opaque, so the token's size is checked as each one
+   arrives: preparing fails as soon as the next would not fit
+   (`storage.MaxPublicationToken`).
+2. The copy's token is recorded on the claim (`claims.Publishing`).
+3. `storage.Publish` completes the upload with that manifest.
+
+If preparing fails with something left to abort (a part request that went
+unanswered, or an abort that failed), it returns a cleanup token with the
+error: the key and upload ID only, checked to fit before any part is
+copied. The claim keeps it, `promoting`, to be fenced.
+
+If the answer is lost, the claim stays `promoting` with its token: the
+copy may exist, and a retried `Confirm` checks the key as it is. No claim
+with a recorded copy is ever forgotten until `storage.Fence` has proven the
+copy can no longer publish. On S3 it aborts the multipart upload, which S3
+orders against completing it: a successful abort means it never completes,
+and `NoSuchUpload` means it is over. That, and only that, is what a
+successful fence proves: the copy can never be published, so it can never
+become an object without a claim. The fence needs only
+`s3:AbortMultipartUpload`. As AWS advises, it then lists the upload's parts
+and aborts again while any are listed, and every sweep fences again while
+the claim's tombstone lasts. That part only frees storage: it uses the
+optional `s3:ListMultipartUploadParts`, and a failure there is reported
+through the driver's warning hook (`s3.Config.Warn`, the app's logger) and
+never fails the fence. A listing is a snapshot,
+though: a part still being processed can land after the last fence. Such a
+part is never an object (it cannot be read or published), only storage
+billed to an aborted upload; a bucket lifecycle rule aborting incomplete
+multipart uploads after a day reclaims it, and is recommended on S3. A
+fence that fails keeps the claim for the next sweep. A sweep abandons a `promoting` claim only once the
+promotion's lease (`Policy.UploadTimeout`) has ended. With the local and
+memory drivers the copy runs in the application process and publishes
+nothing after its call returns.
+
+**Which stores can be owned.** The protocol needs proof about every write
+it lets near a claimed key, so a store must be one of:
+
+- a `storage.Publisher` (S3): its copies can be fenced;
+- a `storage.BoundedWriter` (local, memory): a `Put` publishes, if at all,
+  before it returns, and never once its context has ended.
+
+Any other store, a third-party remote driver for one, is refused:
+`claims.Pending` and `claims.Stage`, `upload.Save`/`Receive`/`Authorize`
+under claims, and `storage.PreparePublish`/`Publish`/`Fence` fail with
+`storage.ErrUnsupported` (`storage.CheckOwnable`). A write such a store sent
+could complete after its claim was forgotten, and nothing could prove
+otherwise.
+
+On a remote store (a `storage.Publisher`: S3), `upload.Save` and
+`upload.Receive` under claims stage too: they put the file at the staging
+key and promote it the same way, since an unanswered `PutObject` cannot be
+fenced. There, only a fenced copy ever writes a claimed key.
+
+**The staging namespace is reserved.** `_staging/` at the root of the
+store belongs to `storage/upload` and `storage/claims`. A late `PUT` can
+only ever publish a staging object, which nothing refers to. A `deleting`
+staged claim deletes its staging object too, and `cl.SweepStaging(ctx)`
+deletes every object under `_staging/` whose key has no live claim (or is
+held: a leftover after promotion), **whoever stored it**. Never store other
+objects there; `upload.Policy` refuses prefixes under it.
+
+Run `SweepStaging` periodically where clients upload straight to the
+backend (S3); it lists `_staging/`. With the local and memory drivers the
+app's own route aborts a signed `PUT` at `storage.SignedUploadTimeout` (an
+hour) after its URL expired, within the staged claim's lease, so `Sweep`
+alone suffices. On S3, a bucket lifecycle rule expiring `_staging/` after a
+day, and aborting incomplete multipart uploads after a day, is a useful
+backstop, but it is not part of the ownership protocol: lifecycle expiry
+is coarse and asynchronous. (It is what reclaims a part that lands after
+its upload was fenced, which is never an object.)
+
+**Ownership.** `Sweep` reads claims, never the store. Outside `_staging/`,
+a file without a claim is outside the protocol: nothing in `storage/claims`
+ever deletes it. That covers a file from a shared library, a key the
+application chose, and files stored before the application adopted claims.
+Inside `_staging/`, the reserved namespace above, the protocol owns
+everything. A claim is one key held by one record: if two records can refer
+to one file (a copied reference), keep that file out of the protocol and
+delete it yourself when the last reference goes.
+
 ## Keys
 
 A key is a `/`-separated path of one or more segments. The same rule
@@ -300,6 +525,117 @@ Serve an upload as an attachment, with the stored filename:
 [`examples/storage`](../examples/storage/main.go) has `POST /uploads` and
 `GET /uploads/:id`.
 
+### Direct uploads
+
+A client can upload a file on its own with a short-lived signed grant, and
+the app checks the result. On S3 the grant is a presigned `PUT` to the bucket,
+so a large file never passes through the application. With the local and
+memory drivers it is a `PUT` to the app's storage route (`/_storage`), which
+streams the bytes into the store: they pass through the app process, but not
+through your handlers or the framework's request parsing.
+
+```go
+// 1. The client declares the file; the app decides it may upload, and grants.
+g, err := upload.Authorize(ctx, app.Storage(), avatars, in.Size, in.ContentType, in.Filename)
+// Remember g.Key with the user who asked; send g.Request to the client.
+
+// 2. The client sends the bytes: g.Request.Method to g.Request.URL, with the
+//    headers in g.Request.Header and the file as the body.
+
+// 3. The client says it is done; the app checks what arrived.
+f, err := upload.Confirm(ctx, app.Storage(), key, avatars)
+```
+
+What a grant enforces:
+
+- **Scope.** A grant is one signed `PUT`:
+  - to one generated key (`Prefix` plus a random id);
+  - of exactly the declared size (at most `MaxBytes`, else `ErrTooLarge`
+    before any grant);
+  - with the declared `Content-Type` (one `Types` accepts) and the metadata
+    (the cleaned filename).
+
+  The backend refuses a request that differs in any of these with `403`:
+  another length, type, metadata or key, or a chunked body. S3 refuses it
+  because they are in the SigV4 signature; the local and memory drivers
+  because `presign.Handler` checks them.
+- **Lifetime and single use.** `Policy.GrantExpiry` is 15 minutes by
+  default. A grant stores only where nothing is stored yet. S3 enforces this
+  with a signed `If-None-Match: *` (412 otherwise); the app's route stores
+  with `PutOptions{IfAbsent: true}` and answers a D10 409. Either way the check
+  and the store are one atomic step, so of two clients using one grant at the
+  same instant, through any number of app processes, exactly one stores. Once
+  the file has been uploaded and confirmed, the grant cannot replace it with
+  other bytes. If `Confirm` refuses a file, it deletes it, and an unexpired
+  grant can then upload again. A `PUT` may start until the grant expires;
+  the app's route aborts one still running `storage.SignedUploadTimeout`
+  later (S3 cannot: under claims, uploads are staged, see
+  [Cleanup](#cleanup)). An S3-compatible service must support
+  conditional writes (`If-None-Match` on `PutObject` and
+  `CompleteMultipartUpload`); AWS S3 and MinIO do.
+- **Headers the grant does not sign.** SigV4 authenticates only the headers
+  a grant signs (length, type, metadata, `If-None-Match`). S3 also keeps five
+  standard headers a client can add unsigned: `Cache-Control`,
+  `Content-Disposition`, `Content-Encoding`, `Content-Language` and `Expires`.
+  It serves them back with the object. A grant never sets them, so on S3
+  `Confirm` refuses (and deletes) an upload that carries any of them
+  (`storage.UploadVerifier`): a confirmed object has only what its grant
+  described. The local and memory drivers keep none of those headers anyway.
+- **Size.** On S3 a direct upload is one presigned `PutObject`, so it is at
+  most 5 GiB (`s3.MaxUploadURLBytes`, S3's single-`PUT` limit); a larger
+  `Size` is `ErrInvalidOptions` rather than a grant that could never succeed.
+  (`Put` has no such limit: it uploads larger objects in parts.)
+- **Expiry and credentials.** A grant signed with temporary credentials (an
+  IAM role's, say) stops working when they expire, whatever its own lifetime.
+  The `Expires` it reports is the earlier of the two.
+- **Confirmation.** The declared type is only a claim, and it is what the
+  store will serve the object as. `Confirm` reads the object's first bytes.
+  It fails, and deletes the object, in any of these cases:
+  - the detected type isn't accepted by the policy (`ErrType`);
+  - the detected type isn't the declared one: a "PNG" whose bytes are HTML,
+    or a JPEG declared as PNG (`ErrType`);
+  - the object is over `MaxBytes` (`ErrTooLarge`).
+
+  Under `Policy.Claims`, it deletes the object only while its key is
+  `pending` (see [Cleanup](#cleanup)). Nothing uploaded is `ErrNoFile`. Confirm only keys you granted, to the
+  user who asked. `Confirm` checks the prefix but not ownership.
+- **Stores.** Direct uploads are an optional interface,
+  `storage.DirectUploader`. The local, memory and S3 drivers implement it.
+  `storage.UploadURL` and `upload.Authorize` return `ErrUnsupported` for a
+  store that doesn't; use `Receive` for those.
+
+A grant that is never used expires. An upload that is never confirmed stays
+stored, with a `pending` claim, until the claims sweep removes it (see
+[Cleanup](#cleanup)).
+
+**Browsers and S3.** A browser's `PUT` to the bucket is cross-origin, so the
+bucket needs a CORS rule allowing it from the app's origin, with every header
+the grant asks for that a browser doesn't send freely: `Content-Type` (with a
+type other than a form's), `If-None-Match` (the single-use condition), and the
+`x-amz-meta-*` metadata. A browser checks them in a preflight before the `PUT`,
+and S3 refuses the preflight if one is missing:
+
+```json
+[{
+  "AllowedOrigins": ["https://app.example.com"],
+  "AllowedMethods": ["PUT"],
+  "AllowedHeaders": ["content-type", "if-none-match", "x-amz-meta-*"],
+  "ExposeHeaders": ["ETag"],
+  "MaxAgeSeconds": 3600
+}]
+```
+
+With the local and memory drivers the grant is a `PUT` to the app's own
+`GOMBIT_STORAGE_LOCAL_URL`. The storage route `framework.New` mounts there is
+exempt from cookie-mode CSRF (the signed URL is the authorization, and no
+cookie is involved, as with S3), the JSON body limit (the signed length bounds
+it) and input sanitization (the file is stored byte for byte). The exemption
+covers that mounted route and nothing else. With `WithStorage` the framework
+mounts no route, so a route your app registers under that path keeps every
+protection.
+[`examples/storage`](../examples/storage/main.go) has `POST /uploads/direct`
+and `POST /uploads/direct/:id/confirm`.
+
 ## Errors
 
 Drivers wrap failures in `*storage.Error` (the operation, the key, and the
@@ -314,6 +650,7 @@ same thing on every driver:
 | `ErrSizeMismatch` | The bytes read differ from the declared `Size` | `422 validation` |
 | `ErrUnavailable` | The backend is unreachable or failed transiently | `503 dependency_unavailable` |
 | `ErrUnknownOutcome` | A `Put` sent the object to a remote backend and never learned whether it was stored; the key holds the old object or the new one | `503 dependency_unavailable` |
+| `ErrExists` | A `Put` with `IfAbsent` found an object already stored under the key | `409 conflict` |
 | `context.DeadlineExceeded` / `Canceled` | The request timed out, or the client went away | `503 dependency_unavailable` |
 | `ErrUnsupported` | The driver cannot do this, for example a URL | `500 internal` |
 | `ErrNotPublic` | A public URL was asked for a private object | `500 internal`: the server chose the key and the kind of URL |
@@ -461,7 +798,10 @@ GOMBIT_STORAGE_S3_FORCE_PATH_STYLE=false      # true for MinIO and most S3-compa
   (`arn:aws:s3:::BUCKET/PREFIX*`), and `s3:ListBucket` on the bucket.
   Without `ListBucket`, S3 answers a request for a missing object with
   `403 Access Denied` instead of 404, and a missing object would become a 500
-  rather than a 404.
+  rather than a 404. `s3:ListMultipartUploadParts` on the objects is
+  optional: a fence (see [Cleanup](#cleanup)) uses it to free parts stored
+  after an abort, and without it leaves them to the lifecycle rule. The
+  fence itself needs only `s3:AbortMultipartUpload`.
 - **Prefix.** `GOMBIT_STORAGE_S3_PREFIX` is a valid key followed by `/`
   (`myapp/prod/`), short enough to leave room for a key: the prefix and key
   together are held to the 1024-byte key limit. It is put before every key.
@@ -536,7 +876,23 @@ The suite checks every guarantee above:
 - concurrent `Put`s to one key;
 - `URL` returning either a URL or `ErrUnsupported` (or `ErrNotPublic` for a
   public URL; never for a signed one), and refusing a lifetime over
-  `MaxURLExpiry`.
+  `MaxURLExpiry`;
+- for a store with direct uploads (`storage.DirectUploader`): invalid keys
+  and options refused, and a grant that stores nothing by itself;
+- for a store that lists (`storage.Lister`): exactly the objects under the
+  prefix, each once, with its size and time; stopping at the callback's
+  error; deleting as it goes; an ended context;
+- publication (`storage.PreparePublish` / `Publish` / `Fence`): preparing
+  publishes nothing; publishing copies the bytes, type and metadata (an
+  empty object too) and refuses an occupied destination; for a
+  `storage.Publisher`, a fenced copy is never published, and fencing is
+  idempotent.
+
+A driver that can take part in `storage/claims` declares how: implement
+`storage.Publisher` if a write it sends can complete after the call
+returns (a remote service), or `storage.BoundedWriter` if it cannot (its
+`Put` publishes within the call, after checking its context). Declaring
+`BoundedWriter` for a remote driver breaks the ownership guarantee.
 
 The suite's own tests prove that every check fails for a driver broken the
 way it guards against. A new check can't land without such a driver.

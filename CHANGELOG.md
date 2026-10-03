@@ -110,6 +110,93 @@ version.
   - authorization stays with the application, before it asks for a URL;
   - `examples/storage` gains `GET /uploads/:id/link`
     ([#327](https://github.com/gombit-dev/gombit/issues/327)).
+- Direct uploads (STORAGE-6):
+  - `upload.Authorize` grants a client one signed upload: a `PUT` of
+    exactly the declared size and type, with the metadata, under a generated
+    key, for `Policy.GrantExpiry` (15 minutes), straight to S3, or to the
+    app's storage route for the local and memory drivers;
+  - `PutOptions.IfAbsent` and `storage.ErrExists` (409): a `Put` that stores
+    only where nothing is stored, atomically on every driver (a no-replace
+    rename locally, `If-None-Match: *` on S3), which keeps a grant single-use
+    across app processes;
+  - `upload.Confirm` then checks the stored object's size and its type (as
+    detected from its bytes, which must be the declared type), and on S3
+    that the client added none of the standard headers S3 keeps unsigned
+    (`Cache-Control`, `Content-Disposition`, `Content-Encoding`,
+    `Content-Language`, `Expires`; `storage.UploadVerifier`), and deletes
+    what fails;
+  - the contract is the optional `storage.DirectUploader`, implemented by
+    `storage/s3` (a presigned `PutObject` with the length, type and metadata
+    signed, at most 5 GiB, whose `Expires` accounts for expiring
+    credentials) and by local and memory (signed `PUT`s to the app's
+    `/_storage` route, which the framework exempts from cookie-mode CSRF,
+    the body limit and sanitization only when it mounted that route);
+  - `examples/storage` gains `POST /uploads/direct` and
+    `POST /uploads/direct/:id/confirm`
+    ([#328](https://github.com/gombit-dev/gombit/issues/328)).
+- Object metadata and cleanup semantics (STORAGE-7):
+  - `ObjectInfo` documents what each field means (an opaque `ETag`, never a
+    checksum to compute; `ModTime`), and gains `StoredFilename()`;
+    `upload.File.Filename` is unchanged;
+  - `storage.Lister` (local, memory, S3) enumerates objects under a prefix,
+    with its own conformance check;
+  - `storage/claims` is the ownership protocol for stored files: a
+    `storage_claims` table (in new apps' migrations) where each key is
+    `pending`, `held` by a record, or `deleting`, moved by conditional
+    updates:
+    - `upload.Policy.Claims` claims each generated key before anything is
+      stored, and deletes a failed upload only while its key is pending (a
+      refused `Confirm` never deletes a held file);
+    - `CreateWith` holds a record's keys in the transaction that writes it
+      and abandons the uploads otherwise, unless a key turns out held (a
+      commit whose answer was lost, a retried confirmation);
+    - `Update` holds new keys and releases replaced ones in the record's
+      transaction, deleting the replaced files once it commits;
+    - `DeleteWith` releases the keys with the record's delete, then deletes
+      the files (a key with no claim is left alone);
+    - `Sweep` abandons stale pending claims and finishes interrupted
+      deletes. It reads claims only, so a file without one is never
+      deleted;
+    - every claim has a lease, the time after which no writer the
+      application controls publishes under its key: `upload.Save`/`Receive`
+      run their `Put` under it (`Policy.UploadTimeout`, an hour by
+      default). A deleting claim stays as a tombstone until its lease has
+      ended, and each sweep deletes its file again, so an upload that
+      publishes after its claim was abandoned is still deleted;
+    - direct uploads under claims are staged: `upload.Authorize` grants a
+      `PUT` to `_staging/<key>` (`upload.StagingKey`), and `upload.Confirm`
+      promotes the claim (`pending → promoting`, won by one confirmation),
+      checks the staged object, and publishes a copy at the key. A client
+      never writes a claimed key, so a presigned S3 `PUT` that ends late
+      only publishes a staging object. On S3, `Save`/`Receive` under claims
+      stage too. The app's storage route also aborts a signed `PUT` at
+      `storage.SignedUploadTimeout` (an hour) after its URL expired;
+    - promotion is fenced: the copy is prepared (`storage.PreparePublish`:
+      on S3 a multipart upload with server-side part copies, publishing
+      nothing), its token recorded on the claim (`claims.Publishing`), then
+      published (`storage.Publish`). A claim with a recorded copy is never
+      forgotten until `storage.Fence` (on S3, aborting the upload) proves
+      it can no longer publish, so a copy of unknown outcome cannot
+      complete after its claim is gone;
+    - `_staging/` is a reserved namespace: `claims.SweepStaging` deletes
+      any object there whose key has no live claim, whoever stored it (a
+      bucket lifecycle rule on `_staging/` is an optional backstop);
+    - `storage.Publisher` (S3: a multipart upload with server-side part
+      copies, completed with the ETags S3 returned for them, its token
+      bounded by construction, a failure returning a cleanup-only token;
+      fenced by aborting, which proves the copy is never published and
+      needs only `s3:AbortMultipartUpload`, then, best effort, re-aborting
+      while parts are listed; `s3.Config.Warn` reports what it could not
+      free) with `storage.PreparePublish` /
+      `Publish` / `Fence`, with a conformance check;
+    - only an ownable store takes part: a `storage.Publisher` or a
+      `storage.BoundedWriter` (local, memory: writes end with their
+      calls). Claims, uploads under claims, and the publication helpers
+      refuse any other store with `storage.ErrUnsupported`
+      (`storage.CheckOwnable`).
+  - `examples/storage` records its uploads in SQLite under claims, deletes
+    them with their records, and sweeps the rest
+    ([#329](https://github.com/gombit-dev/gombit/issues/329)).
 
 ### Changed
 
