@@ -21,6 +21,13 @@
 // ReceiveBody reads a request whose body is the file (PUT or POST with the
 // file's bytes); Save applies the same policy to any reader. MapError turns
 // their errors into D10 errors for a handler.
+//
+// Authorize and Confirm are the direct-upload flow: Authorize grants the
+// client one signed upload (a PUT of a declared size and type, under a
+// generated key, to S3 directly or to the app's storage route for the
+// local and memory drivers; see storage.DirectUploader); the client
+// uploads; Confirm then checks what arrived, by its bytes, and deletes it
+// if it breaks the policy.
 package upload
 
 import (
@@ -125,7 +132,17 @@ type Policy struct {
 	// Metadata is stored with every file, besides FilenameMetadata (which
 	// it must not set).
 	Metadata map[string]string
+	// GrantExpiry is how long a direct upload grant (Authorize) works,
+	// counted from the start of the second it is signed in, as for any
+	// signed URL (DefaultGrantExpiry when zero; whole seconds, at most
+	// storage.MaxURLExpiry).
+	GrantExpiry time.Duration
 }
+
+// DefaultGrantExpiry is how long a direct upload grant works unless
+// Policy.GrantExpiry says otherwise: long enough to start a large upload,
+// short enough that a leaked grant is soon useless.
+const DefaultGrantExpiry = 15 * time.Minute
 
 // File is a stored upload.
 type File struct {
@@ -156,6 +173,9 @@ func (p Policy) validate() error {
 		if !validType(t) {
 			return fmt.Errorf(`upload: Policy.Types entry %q: want a lowercase "type/subtype", "type/*", or "*/*"`, t)
 		}
+	}
+	if p.GrantExpiry < 0 || p.GrantExpiry > storage.MaxURLExpiry || p.GrantExpiry%time.Second != 0 {
+		return fmt.Errorf("upload: Policy.GrantExpiry must be whole seconds between 0 (the default) and %s, not %s", storage.MaxURLExpiry, p.GrantExpiry)
 	}
 	if _, ok := p.Metadata[FilenameMetadata]; ok {
 		return fmt.Errorf("upload: Policy.Metadata must not set %q; the upload's filename goes there", FilenameMetadata)
@@ -612,7 +632,7 @@ func MapError(ctx context.Context, err error) error {
 	case errors.Is(err, ErrType):
 		return contract.WithContext(ctx, contract.Validation("The file's type is not allowed.", nil))
 	case errors.Is(err, ErrNoFile):
-		return contract.WithContext(ctx, contract.Validation("The request has no file.", nil))
+		return contract.WithContext(ctx, contract.Validation("No file was uploaded.", nil))
 	case errors.Is(err, ErrMalformed):
 		return contract.WithContext(ctx, contract.Validation("The upload could not be read.", nil))
 	}

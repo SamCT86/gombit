@@ -275,7 +275,24 @@ func (s *Store) put(ctx context.Context, key string, r io.Reader, opts storage.P
 	if err := s.ensureDir(filepath.Dir(dst)); err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	if err := replaceFile(tmp.Name(), dst); err != nil {
+	// IfAbsent publishes with a rename that refuses to replace: the check
+	// and the store are one step, for every process sharing the root.
+	publish := replaceFile
+	if opts.IfAbsent {
+		publish = renameNoReplaceHook
+	}
+	var leftover *leftoverError
+	if err := publish(tmp.Name(), dst); errors.As(err, &leftover) {
+		// Published (a hard link): only the temporary name remains, in this
+		// store's work directory. The Put has happened; say so, and let the
+		// warning hook report the stray file.
+		if s.warn != nil {
+			s.warn("local storage: an object was stored, but its temporary file could not be removed", leftover)
+		}
+	} else if err != nil {
+		if opts.IfAbsent && errors.Is(err, fs.ErrExist) {
+			return storage.ObjectInfo{}, storage.ErrExists
+		}
 		return storage.ObjectInfo{}, err
 	}
 	// The rename published the object: from here the Put has happened, and
@@ -647,18 +664,15 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 // one. Without a Signer it returns storage.ErrUnsupported (after
 // validating its arguments).
 func (s *Store) URL(ctx context.Context, key string, opts storage.URLOptions) (string, error) {
-	if err := storage.ValidateKey(key); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if err := storage.ValidateURLOptions(opts); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if err := ctx.Err(); err != nil {
-		return "", storage.Wrap("url", key, err)
-	}
-	if s.urls == nil {
-		return "", storage.Wrap("url", key, storage.ErrUnsupported)
-	}
-	u, err := s.urls.URL(key, opts)
-	return u, storage.Wrap("url", key, err)
+	return presign.StoreURL(ctx, s.urls, key, opts)
+}
+
+var _ storage.DirectUploader = (*Store)(nil)
+
+// UploadURL implements storage.DirectUploader with the store's
+// presign.Signer (WithURLs): a signed PUT that presign.Handler stores.
+// Without a Signer it returns storage.ErrUnsupported (after validating its
+// arguments).
+func (s *Store) UploadURL(ctx context.Context, key string, opts storage.UploadURLOptions) (storage.UploadRequest, error) {
+	return presign.StoreUploadURL(ctx, s.urls, key, opts)
 }

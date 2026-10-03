@@ -1013,3 +1013,63 @@ func TestLongRoot(t *testing.T) {
 		t.Fatalf("a second store's Put = %v", err)
 	}
 }
+
+// TestIfAbsentAcrossStores: IfAbsent is atomic for stores that share a
+// root (separate processes, say), not just within one store: of two stores
+// racing to create one key, exactly one succeeds.
+func TestIfAbsentAcrossStores(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root")
+	ctx := context.Background()
+	for round := 0; round < 20; round++ {
+		key := fmt.Sprintf("race/%d", round)
+		results := make(chan error, 2)
+		start := make(chan struct{})
+		for i := 0; i < 2; i++ {
+			s, _ := local.New(root)
+			body := fmt.Sprintf("store %d", i)
+			go func() {
+				<-start
+				_, err := s.Put(ctx, key, strings.NewReader(body), storage.PutOptions{IfAbsent: true})
+				results <- err
+			}()
+		}
+		close(start)
+		won := 0
+		for i := 0; i < 2; i++ {
+			switch err := <-results; {
+			case err == nil:
+				won++
+			case !errors.Is(err, storage.ErrExists):
+				t.Fatalf("round %d: Put = %v, want success or ErrExists", round, err)
+			}
+		}
+		if won != 1 {
+			t.Fatalf("round %d: %d of 2 stores created %q, want exactly one", round, won, key)
+		}
+	}
+}
+
+// TestLinkPublishThatCannotRemoveItsTempIsASuccess: the hard-link fallback
+// publishes the object when it links it; failing to remove the temporary
+// name afterwards does not make the Put a failure (the key holds the new
+// object, and a failure must leave it unchanged): Put succeeds and the
+// warning hook reports the stray file.
+func TestLinkPublishThatCannotRemoveItsTempIsASuccess(t *testing.T) {
+	var warned []error
+	s, _ := local.New(filepath.Join(t.TempDir(), "root"), local.WithWarn(func(_ string, err error) { warned = append(warned, err) }))
+	ctx := context.Background()
+	defer local.UseLinkPublish(func(string) error { return errors.New("remove: permission denied") })()
+	info, err := s.Put(ctx, "k", strings.NewReader("linked"), storage.PutOptions{IfAbsent: true})
+	if err != nil {
+		t.Fatalf("Put = %v; the object was published, so the Put succeeded", err)
+	}
+	if got := readAll(t, s, "k"); got != "linked" || info.Size != 6 {
+		t.Fatalf("the key holds %q (%d), want the new object", got, info.Size)
+	}
+	if len(warned) != 1 || !strings.Contains(warned[0].Error(), "temporary file") {
+		t.Fatalf("warnings = %v, want the stray temporary file reported", warned)
+	}
+	if _, err := s.Put(ctx, "k", strings.NewReader("again"), storage.PutOptions{IfAbsent: true}); !errors.Is(err, storage.ErrExists) {
+		t.Fatalf("a second IfAbsent Put through the link fallback = %v, want ErrExists", err)
+	}
+}

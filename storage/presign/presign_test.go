@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -174,7 +175,7 @@ func TestHandlerErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = r.Body.Close()
-	if r.StatusCode != http.StatusMethodNotAllowed || r.Header.Get("Allow") != "GET, HEAD" {
+	if r.StatusCode != http.StatusMethodNotAllowed || r.Header.Get("Allow") != "GET, HEAD, PUT" {
 		t.Fatalf("POST = %d (Allow %q)", r.StatusCode, r.Header.Get("Allow"))
 	}
 	put(t, store, "public/head.txt", "12345", nil)
@@ -296,6 +297,134 @@ func TestConformance(t *testing.T) {
 	})
 }
 
+// send makes req (a direct upload) with body, the grant's headers, and
+// edit applied to the request last.
+func send(t *testing.T, srv *httptest.Server, req storage.UploadRequest, body string, edit func(*http.Request)) int {
+	t.Helper()
+	r, err := http.NewRequest(req.Method, srv.URL+req.URL, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range req.Header {
+		r.Header.Set(k, v)
+	}
+	if edit != nil {
+		edit(r)
+	}
+	resp, err := srv.Client().Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode
+}
+
+func TestDirectUploads(t *testing.T) {
+	store, srv, c := setup(t)
+	ctx := context.Background()
+	opts := storage.UploadURLOptions{Expires: 10 * time.Minute, Size: 5, ContentType: "text/plain", Metadata: map[string]string{"filename": "résumé.txt"}}
+	req, err := store.UploadURL(ctx, "uploads/a", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Method != http.MethodPut || req.Header["Content-Type"] != "text/plain" || !req.Expires.Equal(c.t.Add(10*time.Minute)) {
+		t.Fatalf("UploadURL = %+v", req)
+	}
+	parsed, _ := url.Parse(req.URL)
+	q := parsed.Query()
+	with := func(name, value string) storage.UploadRequest {
+		q := parsed.Query()
+		q.Set(name, value)
+		alt := req
+		alt.URL = parsed.Path + "?" + q.Encode()
+		return alt
+	}
+	other := req
+	other.URL = "/_storage/uploads/b?" + parsed.RawQuery
+	read, _ := store.URL(ctx, "uploads/a", storage.SignedURL(time.Minute))
+	readAsUpload := req
+	readAsUpload.URL = read
+	for name, tc := range map[string]struct {
+		req  storage.UploadRequest
+		body string
+		edit func(*http.Request)
+	}{
+		"a longer body":        {req, "hello world", nil},
+		"a shorter body":       {req, "hi", nil},
+		"another type":         {req, "hello", func(r *http.Request) { r.Header.Set("Content-Type", "text/html") }},
+		"no type":              {req, "hello", func(r *http.Request) { r.Header.Del("Content-Type") }},
+		"chunked":              {req, "hello", func(r *http.Request) { r.ContentLength = -1 }},
+		"another key":          {other, "hello", nil},
+		"a larger signed size": {with("size", "50"), "hello", nil},
+		"another signed type":  {with("type", "text/html"), "hello", func(r *http.Request) { r.Header.Set("Content-Type", "text/html") }},
+		"other metadata":       {with("meta", "e30"), "hello", nil},
+		"a later expiry":       {with("expires", "9999999999"), "hello", nil},
+		"no signature":         {with("signature", ""), "hello", nil},
+		"a read URL":           {readAsUpload, "hello", nil},
+		"a repeated size":      {storage.UploadRequest{Method: req.Method, URL: req.URL + "&size=5", Header: req.Header}, "hello", nil},
+		"a repeated meta":      {storage.UploadRequest{Method: req.Method, URL: req.URL + "&meta=e30", Header: req.Header}, "hello", nil},
+	} {
+		if code := send(t, srv, tc.req, tc.body, tc.edit); code != http.StatusForbidden {
+			t.Errorf("%s: PUT = %d, want 403", name, code)
+		}
+	}
+	if keys := store.Keys(); len(keys) != 0 {
+		t.Fatalf("refused uploads stored %v", keys)
+	}
+	if q.Get("signature") == "" {
+		t.Fatal("no signature")
+	}
+
+	if code := send(t, srv, req, "hello", nil); code != http.StatusOK {
+		t.Fatalf("the granted PUT = %d", code)
+	}
+	body, info, err := store.Open(ctx, "uploads/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(body)
+	_ = body.Close()
+	if string(b) != "hello" || info.ContentType != "text/plain" || info.Metadata["filename"] != "résumé.txt" {
+		t.Fatalf("stored %q %+v", b, info)
+	}
+	// The grant is spent: it cannot replace what it stored.
+	if code := send(t, srv, req, "HELLO", nil); code != http.StatusConflict {
+		t.Fatalf("replaying the grant = %d, want 409", code)
+	}
+	if body, _, _ := store.Open(ctx, "uploads/a"); body != nil {
+		b, _ := io.ReadAll(body)
+		_ = body.Close()
+		if string(b) != "hello" {
+			t.Fatalf("the replay replaced the object with %q", b)
+		}
+	}
+	// The upload URL does not read the object.
+	if resp, _ := get(t, srv, req.URL); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET with the upload URL = %d, want 403", resp.StatusCode)
+	}
+	c.t = c.t.Add(10 * time.Minute)
+	if code := send(t, srv, req, "hello", nil); code != http.StatusForbidden {
+		t.Fatalf("PUT at the expiry = %d, want 403", code)
+	}
+}
+
+func TestDirectUploadOfAnEmptyObject(t *testing.T) {
+	store, srv, _ := setup(t)
+	req, err := store.UploadURL(context.Background(), "uploads/empty", storage.UploadURLOptions{Expires: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Header["Content-Type"] != storage.DefaultContentType {
+		t.Fatalf("header = %v", req.Header)
+	}
+	if code := send(t, srv, req, "", nil); code != http.StatusOK {
+		t.Fatalf("PUT empty = %d", code)
+	}
+	if info, err := store.Stat(context.Background(), "uploads/empty"); err != nil || info.Size != 0 {
+		t.Fatalf("Stat = %+v, %v", info, err)
+	}
+}
+
 // TestSignedURLForAPublicKeyExpires: a signed URL holds to what it says
 // even when its key is public: past its expiry it is refused, and a forged
 // signature is refused. The same key without the query still serves the
@@ -360,5 +489,55 @@ func TestBaseRuleIsShared(t *testing.T) {
 		if (newErr == nil) != valid || (cfgErr == nil) != valid {
 			t.Errorf("Base %q: presign.New = %v, config = %v; want valid = %v", base, newErr, cfgErr, valid)
 		}
+	}
+}
+
+// TestOneGrantStoresOnceAcrossHandlers: one upload grant used at the same
+// instant through separate handlers (as by separate app processes sharing
+// a store) stores once: exactly one PUT succeeds, the others are 409.
+func TestOneGrantStoresOnceAcrossHandlers(t *testing.T) {
+	c := &clock{t: time.Unix(1_800_000_000, 0)}
+	signer := newSigner(t, c)
+	store := memory.New(memory.WithURLs(signer))
+	var servers []*httptest.Server
+	for i := 0; i < 4; i++ {
+		mux := http.NewServeMux()
+		mux.Handle(signer.Path()+"/", presign.Handler(store, signer)) // a handler of its own
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		servers = append(servers, srv)
+	}
+	req, err := signer.UploadURL("uploads/once", storage.UploadURLOptions{Expires: time.Minute, Size: 5, ContentType: "text/plain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codes := make(chan int, 2*len(servers))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 2*len(servers); i++ {
+		srv := servers[i%len(servers)]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			codes <- send(t, srv, req, "bytes", nil)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(codes)
+	ok, conflict := 0, 0
+	for code := range codes {
+		switch code {
+		case http.StatusOK:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		default:
+			t.Fatalf("a PUT with the grant = %d, want 200 or 409", code)
+		}
+	}
+	if ok != 1 || conflict != 2*len(servers)-1 {
+		t.Fatalf("%d PUTs succeeded and %d conflicted; want exactly one success", ok, conflict)
 	}
 }
