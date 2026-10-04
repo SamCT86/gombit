@@ -197,6 +197,39 @@ version.
   - `examples/storage` records its uploads in SQLite under claims, deletes
     them with their records, and sweeps the rest
     ([#329](https://github.com/gombit-dev/gombit/issues/329)).
+- Storage-backed model fields (MODEL-8):
+  - `file` and `image` field kinds (`types.File`, `types.Image`) store an
+    object key, never bytes. The column has a unique index, so one record
+    owns each file.
+  - A `storage:"prefix=...;max_bytes=...;types=..."` tag sets the field's
+    upload policy.
+  - `gombit generate` emits:
+    - an upload-grant operation per file field;
+    - create checks: the key must be a confirmed upload under the field's
+      prefix, passing the policy by its bytes, claimed for that field (each
+      policy's `Scope`, `"<package>.<column>"`), and the insert holds its
+      claim in the same transaction (`storage/claims`), so another field's
+      grant, another record's file or an expired upload is refused and a
+      failed insert deletes the uploads;
+    - reads that return `{key, filename, size, content_type, url}`.
+  - The generated forms upload the chosen file directly to storage on every
+    submit (never reusing a key from a failed attempt), and the lists link
+    to it.
+  - `storage/claims` claims record a scope (`upload.Policy.Scope`);
+    `upload.Confirm` accepts only a key claimed for its policy's scope
+    (`claims.Promote` matches it, new `claims.Belongs`).
+  - The runtime is `storage/filefield`.
+  - The admin leaves file columns out until it has a file widget, and does
+    nothing to them it cannot honour: delete is off for such a model (a
+    deleted row would strand its held file), create is off when a file
+    column is required (it would store the empty key), updates leave file
+    columns out of the write, and an explicit `Actions.Delete`,
+    `Actions.Create` (with a required file) or `Options.Fields` entry
+    mapping a file column is a registration error. An explicit `Field.Column` alone picks the
+    model field the admin reads and writes (it used to race `Name` in
+    schema order), so the guards and the accessors agree on one column.
+  - `examples/storage` gains a `Document` resource
+    ([#530](https://github.com/gombit-dev/gombit/issues/530)).
 
 ### Changed
 
@@ -226,6 +259,46 @@ version.
   now fails `Register` at startup instead of writing the wrong row. Give such
   a model a single-column primary key, or keep it out of the admin registry
   ([#453](https://github.com/gombit-dev/gombit/issues/453)).
+- With `GOMBIT_HTTP_REQUEST_TIMEOUT` set, the response a handler writes when
+  its request deadline fires (a 504 with the D10 envelope) now reaches the
+  client. The `http.Server` `WriteTimeout` equalled the request timeout and
+  is armed before the handler's context is created, so it always expired
+  first and the client saw the connection close (`EOF`). `WriteTimeout` is now
+  the request timeout plus 5s; with the timeout unset the server timeouts are
+  unchanged ([#430](https://github.com/gombit-dev/gombit/issues/430)).
+- `framework.SanitizeHTML` (and `Security.SanitizeInput`) no longer deletes
+  plain text after a stray `<` when the value also carries a real tag:
+  `<i>note</i>: if a<b then stop` used to become `note: if a`, and a `</3`
+  or unclosed `<!--` ate the rest of the value. That tail now comes back
+  exactly as `SanitizeHTML` returns it on its own (the existing check for a
+  value with no complete tag), so it is kept as raw, undecoded input; it is
+  no safer than that check, and complete tags elsewhere are still stripped
+  ([#433](https://github.com/gombit-dev/gombit/issues/433)).
+- The benchmark report no longer publishes a snapshot from a developer host
+  as if it were the canonical run. A clean tree on the canonical protocol used
+  to render with no banner whatever machine ran it. Each measured unit now
+  records the operator's `BENCHMARK_HOST_CLASS` declaration as `host_class`,
+  and `make benchmark-report` stamps the README block "Not measured on
+  dedicated hardware" unless every published unit declares `dedicated`. An
+  undeclared host counts as not dedicated, so the committed snapshot now
+  carries the banner. The declaration must be `dedicated`, `developer` or
+  unset; the `make benchmark-*` targets and every producer refuse any other
+  value before measuring ([#291](https://github.com/gombit-dev/gombit/issues/291)).
+- `OnStop` hooks get their own shutdown-timeout budget instead of what the
+  HTTP drain left over. A request that outlived the shutdown timeout used to
+  hand every stop hook an already-expired context, so a hook that honors its
+  context (flush a buffer, close a pool) failed at once. A full shutdown can
+  now take the drain delay plus up to twice the shutdown timeout
+  ([#431](https://github.com/gombit-dev/gombit/issues/431)).
+- A request whose handler panics is now counted in
+  `gombit_http_requests_total` and `gombit_http_request_duration_seconds_sum`
+  with `status="500"`. The metrics layer recorded a request only after the
+  handler returned, so a panic unwound past it and the request never appeared
+  in `/metrics`. A handler that had already sent its status before panicking
+  is counted at that status; one that only set it is counted as 500, which is
+  what the client receives. A panic that aborts the connection
+  (`http.ErrAbortHandler`) before anything is sent is also counted as 500
+  ([#432](https://github.com/gombit-dev/gombit/issues/432)).
 
 ## [0.6.0] — 2026-09-28
 
