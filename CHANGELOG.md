@@ -259,6 +259,12 @@ version.
   now fails `Register` at startup instead of writing the wrong row. Give such
   a model a single-column primary key, or keep it out of the admin registry
   ([#453](https://github.com/gombit-dev/gombit/issues/453)).
+- With `GOMBIT_HTTP_REQUEST_TIMEOUT` set, the response a handler writes when
+  its request deadline fires (a 504 with the D10 envelope) now reaches the
+  client. The `http.Server` `WriteTimeout` equalled the request timeout and
+  is armed before the handler's context is created, so it always expired
+  first and the client saw the connection close (`EOF`). `WriteTimeout` is now
+  the request timeout plus 5s; with the timeout unset the server timeouts are
 - The benchmark report no longer publishes a snapshot from a developer host
   as if it were the canonical run. A clean tree on the canonical protocol used
   to render with no banner whatever machine ran it. Each measured unit now
