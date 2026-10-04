@@ -226,8 +226,91 @@ arbitrary Go types.
   stored keys, including custom keys, and echo them in meta.
 
 Closed field types: `string`, `text`, `integer`, `float`, `decimal`,
-`boolean`, `datetime`, `date`, `time`, `duration`, `uuid`, `json`, `relation`. These strings are
+`boolean`, `datetime`, `date`, `time`, `duration`, `uuid`, `json`, `file`, `image`, `relation`. These strings are
 the admin projection of the shared vocabulary in [fields.md](fields.md).
+
+### File and image fields
+
+A `types.File` or `types.Image` column (see
+[fields.md § Storage-backed fields](fields.md#storage-backed-fields)) is a
+`file` or `image` field. Its upload policy comes from the model's `storage`
+tag. Without a `prefix`, the field owns `<table>/<column>/`. Meta carries the
+policy as hints: `accept` (media types) and `max_bytes`.
+
+- **Rows** carry a file object: `key`, `filename`, `size`, `content_type`,
+  and `url`, which is signed for 15 minutes unless the file is public.
+  `missing` is `true` when the store no longer has the file. Lists resolve
+  files a few rows at a time.
+- **Uploads:** `POST /api/v1/admin/resources/{slug}/uploads/{field}` with
+  `{size, content_type, filename}` grants one direct upload
+  ([storage.md § Direct uploads](storage.md#direct-uploads)). The grant needs
+  the model's create or update permission, and the declared size and type
+  must fit the policy. The grant claims the key as a staged upload (see
+  [storage.md § Cleanup](storage.md#cleanup)): the SPA sends the bytes to
+  `_staging/<key>` with the grant, then puts the key in the form, and the
+  write's check promotes the staged object to the key. The app needs the
+  `storage_claims` table (apps made by `gombit new` migrate it).
+- **Writes** take the key, or the row's file object (sending it back keeps
+  the file), or `null` to remove it. A blank key (`""`, or a file object
+  whose `key` is `""`) is `null` too, so a required file field refuses it, on
+  create and on update. A malformed file object (no `key`, or a null or
+  non-string one) is a field error, never a removal. A changed key is accepted only if it is:
+  - an upload that passes the policy by its bytes (a refused file is
+    deleted, unless a record holds it);
+  - under the field's prefix;
+  - granted for this field: the admin's grants are claimed for
+    `admin:<slug>.<field>`, so another field's grant (even under the same
+    prefix) is refused ("is not an upload for this field");
+  - still live: held by no other record, and not expired, swept, or
+    discarded by a failed save ("has expired or was discarded; choose the
+    file again").
+
+  Anything else is a field error: 422 with `fields.<name>`.
+- **Concurrent writers:** an update or a delete is fenced on the file keys
+  it loaded, empty ones included. If another writer attached, replaced or
+  removed a file of the row meanwhile, it matches no row: a 409, nothing
+  written, and its new uploads are discarded. After any failed save (a field
+  error raised inside the write discards them too), the SPA drops the files
+  uploaded for it from the form and asks for them again. An update writes a
+  file column only when it changes its key; an unchanged one is left out of
+  the write.
+- **Fields and storage:** an explicit `Options.Fields` entry for a file or
+  image column must be declared as the column's own kind (`image` for a
+  `types.Image` column, `file` for a `types.File` one): another type would
+  write keys past the upload protocol, and the other kind would change the
+  policy (a `file` field accepts any type), so registration refuses it.
+  File fields need the host's object storage; a host without it cannot
+  register them.
+- **Unmapped file columns:** a file column the admin does not map, because
+  it is hidden (`gombit:"server"`, `gombit:"-"`) or left out of explicit
+  `Fields`, cannot be written at all. Delete is then off, and create too
+  when the column is required (it would store an empty key). Asking for
+  either is a registration error. Updates leave the column out of their
+  write.
+- **Cleanup:** a write moves the record's file claims in its own
+  transaction (`claims.Update`): new keys are held, and replaced or removed
+  ones released. A write that fails (a stale version, say) abandons the new
+  uploads and keeps the old files. Once it commits, the released files are
+  deleted; a delete releases all of the record's files the same way. A failed
+  file delete is retried by the claims sweep, which also removes uploads the
+  operator chose but never saved (the widget uploads as soon as a file is
+  picked). Run `claims.Sweep(ctx, grace)` periodically; one sweep covers every
+  field. A file without a claim (stored before the app adopted claims) is
+  never deleted.
+- **The SPA:**
+  - the list links each file;
+  - the detail page and the form preview an image;
+  - the form's widget uploads a chosen file at once, and offers Remove for an
+    optional field;
+  - the server checks a file's type from its contents, and that must match
+    the type the browser declares: a file whose contents read as another
+    type (a CSV is plain text, a DOCX or XLSX a zip) can be refused after it
+    is uploaded, even on a field that accepts any type. The widget's hint
+    says so.
+
+  The admin page's Content-Security-Policy allows the store's origin, such as
+  an S3 bucket or a CDN, for images and requests, so previews and direct
+  uploads work there too.
 
 Relation `kind` is `belongs_to`, `one_to_one`, `has_many`, or `many_to_many`.
 **`belongs_to`** and **`one_to_one`** are stored as the foreign key on

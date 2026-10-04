@@ -217,19 +217,54 @@ version.
     to it.
   - `storage/claims` claims record a scope (`upload.Policy.Scope`);
     `upload.Confirm` accepts only a key claimed for its policy's scope
-    (`claims.Promote` matches it, new `claims.Belongs`).
+    (`claims.Promote` matches it, new `claims.Lookup`); a key with no live
+    claim (expired, swept, discarded by a failed write, never granted) is
+    `upload.ErrExpired`, told apart from another field's key.
   - The runtime is `storage/filefield`.
-  - The admin leaves file columns out until it has a file widget, and does
-    nothing to them it cannot honour: delete is off for such a model (a
-    deleted row would strand its held file), create is off when a file
-    column is required (it would store the empty key), updates leave file
-    columns out of the write, and an explicit `Actions.Delete`,
-    `Actions.Create` (with a required file) or `Options.Fields` entry
-    mapping a file column is a registration error. An explicit `Field.Column` alone picks the
-    model field the admin reads and writes (it used to race `Name` in
-    schema order), so the guards and the accessors agree on one column.
+  - Admin support (file widget, uploads, deletion through the claims)
+    comes with STORAGE-8, below.
   - `examples/storage` gains a `Document` resource
     ([#530](https://github.com/gombit-dev/gombit/issues/530)).
+- Admin support for storage-backed fields (STORAGE-8):
+  - `file` and `image` admin types; the meta carries each field's `accept`
+    and `max_bytes`;
+  - rows carry file objects with download URLs;
+  - an explicit `Options.Fields` entry for a file or image column must be
+    declared `file` or `image` (any other type is a registration error, so
+    no admin write bypasses the upload protocol);
+  - an explicit `Field.Column` alone picks the model field the admin reads
+    and writes (it used to race `Name` in schema order), so the file guards
+    and the accessors agree on one column;
+  - updates and deletes are fenced on the file keys they loaded (empty ones
+    included): a concurrent attach, replacement or removal of a file makes
+    them a 409 with nothing written (a delete's 409 is no longer a 500), and
+    an update leaves unchanged and unmapped file columns out of the write;
+  - a blank key (`""`, or a file object whose `key` is `""`) is no file, so
+    a required file field refuses it on create and update; a malformed file
+    object (no key, a null or non-string one) is a 422, never a removal;
+  - an explicit file field must be declared as its column's own kind
+    (`image` for an image column), and file fields need the host's storage;
+  - a file column the admin does not map (hidden, or left out of explicit
+    `Fields`) turns delete off, and create when it is required; asking for
+    either is a registration error;
+  - an upload a failed save discarded is reported as expired ("choose the
+    file again", `upload.ErrExpired`), not as another field's, and the SPA
+    drops the uploads of any failed save from the form and asks for them
+    again;
+  - `POST /admin/resources/{slug}/uploads/{field}` grants a direct upload,
+    and needs create or update permission;
+  - writes accept a key only for an upload under the field's prefix that
+    passes its policy, and hold its claim in the write's transaction
+    (`storage/claims`), so another record's file is refused;
+  - files replaced, removed, or taken with a deleted record are released in
+    that transaction and deleted once it commits; a failed write abandons
+    its new uploads;
+  - the SPA's file widget uploads, previews images, and removes, and lists
+    and detail pages link files;
+  - the admin and embedded SPA pages allow the store's origin in their
+    Content-Security-Policy;
+  - `examples/admin` gains a `Brochure` model
+    ([#330](https://github.com/gombit-dev/gombit/issues/330)).
 
 ### Changed
 
