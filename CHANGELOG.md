@@ -197,6 +197,39 @@ version.
   - `examples/storage` records its uploads in SQLite under claims, deletes
     them with their records, and sweeps the rest
     ([#329](https://github.com/gombit-dev/gombit/issues/329)).
+- Storage-backed model fields (MODEL-8):
+  - `file` and `image` field kinds (`types.File`, `types.Image`) store an
+    object key, never bytes. The column has a unique index, so one record
+    owns each file.
+  - A `storage:"prefix=...;max_bytes=...;types=..."` tag sets the field's
+    upload policy.
+  - `gombit generate` emits:
+    - an upload-grant operation per file field;
+    - create checks: the key must be a confirmed upload under the field's
+      prefix, passing the policy by its bytes, claimed for that field (each
+      policy's `Scope`, `"<package>.<column>"`), and the insert holds its
+      claim in the same transaction (`storage/claims`), so another field's
+      grant, another record's file or an expired upload is refused and a
+      failed insert deletes the uploads;
+    - reads that return `{key, filename, size, content_type, url}`.
+  - The generated forms upload the chosen file directly to storage on every
+    submit (never reusing a key from a failed attempt), and the lists link
+    to it.
+  - `storage/claims` claims record a scope (`upload.Policy.Scope`);
+    `upload.Confirm` accepts only a key claimed for its policy's scope
+    (`claims.Promote` matches it, new `claims.Belongs`).
+  - The runtime is `storage/filefield`.
+  - The admin leaves file columns out until it has a file widget, and does
+    nothing to them it cannot honour: delete is off for such a model (a
+    deleted row would strand its held file), create is off when a file
+    column is required (it would store the empty key), updates leave file
+    columns out of the write, and an explicit `Actions.Delete`,
+    `Actions.Create` (with a required file) or `Options.Fields` entry
+    mapping a file column is a registration error. An explicit `Field.Column` alone picks the
+    model field the admin reads and writes (it used to race `Name` in
+    schema order), so the guards and the accessors agree on one column.
+  - `examples/storage` gains a `Document` resource
+    ([#530](https://github.com/gombit-dev/gombit/issues/530)).
 
 ### Changed
 
