@@ -9,6 +9,7 @@ import (
 	"github.com/gombit-dev/gombit/config"
 	"github.com/gombit-dev/gombit/field"
 	"github.com/gombit-dev/gombit/resourcepolicy"
+	"github.com/gombit-dev/gombit/storage/filefield"
 	"gorm.io/gorm/schema"
 )
 
@@ -77,6 +78,21 @@ func registerModel(host Host, model any, opts Options) error {
 	// explicitly with an empty (non-nil) slice.
 	if err := fillConstraints(opts.Fields, sch); err != nil {
 		return err
+	}
+	if err := fillFilePolicies(opts.Slug, opts.Fields, sch); err != nil {
+		return err
+	}
+	// A file field is written through the claims, over the host's store:
+	// without one, clearing a file or deleting a row would write past the
+	// claims and strand the files they hold. Refuse it here.
+	for _, f := range opts.Fields {
+		if f.Type != TypeFile && f.Type != TypeImage {
+			continue
+		}
+		if st, ok := host.(storer); !ok || st.Storage() == nil {
+			return fmt.Errorf("admin: field %q of %s is a file or image, and the host has no object storage to keep its files in", f.Name, opts.Slug)
+		}
+		break
 	}
 	if err := alignQuerySurface(&opts, sch, derived); err != nil {
 		return err
@@ -171,6 +187,9 @@ func registerModel(host Host, model any, opts Options) error {
 	}
 	for i := range m.fields {
 		m.fieldByName[m.fields[i].Name] = &m.fields[i]
+		if m.fields[i].policy != nil {
+			m.files = append(m.files, &m.fields[i])
+		}
 	}
 	m.version = detectVersionField(sch)
 	// The optimistic-lock update path (updateVersioned) and the many-to-many
@@ -550,12 +569,20 @@ func resolveFields(fields []Field, sch *schema.Schema) ([]resolvedField, []*m2mB
 		}
 		// A storage-backed column's key may only be written through the
 		// upload protocol (a confirmed upload, held in the record's
-		// transaction: storage/claims), which the admin does not take part
-		// in yet (STORAGE-8). Mapped as any other type, an explicit field
-		// would write arbitrary keys past it, and strand the claim of the
-		// key it replaced.
+		// transaction: storage/claims), which only the file and image
+		// types take part in (files.go). Mapped as any other type, an
+		// explicit field would write arbitrary keys past it, and strand the
+		// claim of the key it replaced.
 		if isFileColumn(sf) {
-			return nil, nil, nil, fmt.Errorf("admin: field %q maps the storage-backed (file or image) column %q, which the admin cannot write yet (STORAGE-8); leave it out of Fields", f.Name, sf.DBName)
+			// Declared as the column's own kind: a file field's writes go
+			// through the upload protocol, and the kind sets the policy
+			// (an image column's image types). Another type would bypass
+			// the protocol; the other file kind would change the policy
+			// (TypeFile on an image column accepts any type). Narrowing
+			// belongs in the storage tag.
+			if want := inferFieldType(sf); f.Type != want {
+				return nil, nil, nil, fmt.Errorf("admin: field %q maps the storage-backed column %q, a %s, as %q; declare it as %q (its writes go through the upload protocol, under the column's own policy)", f.Name, sf.DBName, want, f.Type, want)
+			}
 		}
 		// The column is the matched schema field's, the one the accessors
 		// below read and write: never a caller string that could name
@@ -569,6 +596,34 @@ func resolveFields(fields []Field, sch *schema.Schema) ([]resolvedField, []*m2mB
 		})
 	}
 	return out, bindings, hasMany, nil
+}
+
+// fillFilePolicies parses each file or image field's upload policy from the
+// model's storage tag (the prefix it owns, its largest file, the types it
+// accepts; see filefield.Policy). A field without a prefix owns
+// <table>/<column>/. Its Scope is "admin:<slug>.<field>": the admin's
+// grants are claimed for that field of that model, and only it can accept
+// them (storage/claims), whatever the prefixes.
+func fillFilePolicies(slug string, fields []Field, sch *schema.Schema) error {
+	for i := range fields {
+		f := &fields[i]
+		if f.Type != TypeFile && f.Type != TypeImage {
+			continue
+		}
+		sf := matchSchemaField(sch, *f)
+		if sf == nil {
+			return fmt.Errorf("admin: file field %q does not exist on the model", f.Name)
+		}
+		p, err := filefield.Policy(sf.Tag.Get("storage"), field.Kind(f.Type), sch.Table+"/"+sf.DBName+"/")
+		if err != nil {
+			return fmt.Errorf("admin: field %q: %w", f.Name, err)
+		}
+		p.Scope = "admin:" + slug + "." + f.Name
+		f.policy = &p
+		f.Accept = append([]string(nil), p.Types...)
+		f.MaxBytes = p.MaxBytes
+	}
+	return nil
 }
 
 // unmappedFileColumns are sch's storage-backed columns (file, image) that
