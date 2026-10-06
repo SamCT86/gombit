@@ -421,6 +421,33 @@ version.
   options, flags or driver, and worker mode's `-h`. An `App` runs once; it
   cannot be run again after any of them returns
   ([#435](https://github.com/gombit-dev/gombit/issues/435)).
+- Every database write refuses a timestamp or date no supported driver can
+  store and return, with a 422 on that field. Any RFC 3339 timestamp was
+  accepted: Postgres stored `0000-01-01T00:00:00Z` as 1 BC, after which the
+  row's endpoint and every list page holding it could no longer be read, and
+  MySQL refused it with a 500. `database.Open` now registers a
+  `gombit:timerange` callback, next to the `Validate` hook, that checks every
+  `time.Time`, `sql.NullTime` and `types.Date` value a create or update writes
+  (`Create`, `Save`, `Updates`, `Update`, `UpdateColumns`, upsert
+  `DO UPDATE` literals, honouring `Select`/`Omit`) against
+  `1000-01-02T00:00:00Z`..`9999-12-30T23:59:59Z` (a day's margin for the time
+  zone a value is read into) and `1000-01-01`..`9999-12-31`
+  (`types.TimeBounds`, `types.DateBounds`, `types.TimeWithin`,
+  `types.DateWithin`). It covers the generated API, the admin data plane and
+  custom code alike, with no regeneration, and adds no allocation to an
+  ordinary write. **Behaviour change:** a zero `time.Time` a write sets (a
+  non-pointer field left unset on create, a zero in a map, `Update` or a
+  `Select` naming the column) is now a 422 on every driver; it was stored on
+  SQLite/PostgreSQL and a 500 on MySQL. Use a pointer for an optional time.
+  `Save` of a struct with an unset `CreatedAt` or defaulted column leaves
+  that column out of its update (the row's value stays; the insert fallback
+  fills it). Rows that already store the zero instant stay editable through
+  `Update`, a partial `Updates` and the admin, which keeps a stored zero in
+  any column a PATCH does not set unless a hook repairs it
+  (`database.StoredZeroColumns`, `database.KeepStoredZeros`); a generic
+  `Save` of one is a 422 until the column is cleaned up
+  (see docs/database.md). A string no Go time parses (`'infinity'`) is refused too
+  ([#443](https://github.com/gombit-dev/gombit/issues/443)).
 - A response that cannot be encoded as JSON is answered with HTTP 500 and the
   D10 `internal` envelope (with the request ID), and logged through the app's
   logger. Huma decided the status before encoding, so a stored time outside
