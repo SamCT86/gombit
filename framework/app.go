@@ -43,8 +43,21 @@ const defaultShutdownTimeout = 10 * time.Second
 // per-handler context deadline is opt-in, but the connection-level safety net
 // against slow or stuck sockets is not — a disabled per-handler deadline must
 // not mean an unbounded ReadTimeout/WriteTimeout/IdleTimeout. When
-// RequestTimeout is set, it still drives all three, unchanged.
+// RequestTimeout is set, it drives all three, WriteTimeout plus
+// requestTimeoutWriteGrace.
 const defaultHTTPServerTimeout = 60 * time.Second
+
+// requestTimeoutWriteGrace is how far the connection write deadline outlasts
+// the per-handler deadline when HTTP.RequestTimeout is set (issue #430).
+//
+// net/http arms the write deadline when it finishes reading the request
+// headers, which is before request_context derives the handler's context. With
+// equal durations the write deadline therefore expires first, and a handler
+// that honors its context and then writes its timeout response (504, D10
+// envelope with request_id) has that write dropped: the client sees the
+// connection close instead. The grace leaves the handler time to return and
+// write its response after its own deadline fires.
+const requestTimeoutWriteGrace = 5 * time.Second
 
 // Hook is an application lifecycle callback.
 type Hook func(context.Context) error
@@ -54,16 +67,20 @@ type Option func(*App) error
 
 // App owns Gombit's runtime lifecycle and HTTP router.
 type App struct {
-	cfg                config.Config
-	cfgSet             bool
-	cache              cache.Cache
-	cacheStore         *cache.Store
-	cacheOwned         bool
-	redis              *redis.Client
-	jobs               *jobs.Dispatcher
-	jobsOwned          bool
-	jobMetrics         *jobs.Metrics
-	storage            storage.Storage
+	cfg        config.Config
+	cfgSet     bool
+	cache      cache.Cache
+	cacheStore *cache.Store
+	cacheOwned bool
+	redis      *redis.Client
+	jobs       *jobs.Dispatcher
+	jobsOwned  bool
+	jobMetrics *jobs.Metrics
+	storage    storage.Storage
+	// storageOrigins are the store's URL origins for the SPA pages' CSP
+	// (spaStorageOrigins).
+	storageOrigins     []string
+	storageOriginsOnce sync.Once
 	workerQueues       []string // consumed by RunWorker in this process
 	db                 *database.DB
 	logger             *zap.Logger
@@ -99,12 +116,24 @@ type namedMiddleware struct {
 }
 
 // New creates an application using process configuration and the default router.
-func New(options ...Option) (*App, error) {
+func New(options ...Option) (_ *App, err error) {
 	app := &App{
 		cfg:             config.Default(),
 		shutdownTimeout: defaultShutdownTimeout,
 		jobMetrics:      jobs.NewMetrics(),
 	}
+	// A failed New never hands the caller an *App, so nothing else can release
+	// what it opened: the cache (whose in-memory driver runs a janitor
+	// goroutine, and whose Redis driver holds a pool) and the job dispatcher
+	// (issue #435). Only what New opened itself is closed; a cache or
+	// dispatcher passed in with WithCache/WithJobs belongs to the caller.
+	defer func() {
+		if err != nil {
+			if releaseErr := app.releaseOwned(); releaseErr != nil {
+				err = errors.Join(err, releaseErr)
+			}
+		}
+	}()
 
 	for _, option := range options {
 		if option == nil {
@@ -155,7 +184,14 @@ func New(options ...Option) (*App, error) {
 			RequestID: GetRequestIDFromContext,
 		})
 		// OpenAPI Info.Version stays 0.0.0 until runtime versioning lands.
-		app.api = humagin.New(app.router, contract.HumaConfigFor(app.cfg.AppName, "0.0.0", app.cfg.API.DocsEnabled))
+		humaConfig := contract.HumaConfigFor(app.cfg.AppName, "0.0.0", app.cfg.API.DocsEnabled)
+		// A response that cannot be encoded is answered as a D10 500; log why
+		// through the app's logger (#442).
+		logger := app.logger
+		humaConfig.Formats = contract.JSONFormats(func(requestID string, err error) {
+			logger.Error("http: response could not be encoded", zap.String("request_id", requestID), zap.Error(err))
+		})
+		app.api = humagin.New(app.router, humaConfig)
 	}
 	if app.cache == nil {
 		store, err := cache.Open(app.cfg.Cache)
@@ -216,16 +252,27 @@ func New(options ...Option) (*App, error) {
 			}
 			// Framework-owned admin SPA (ADMIN-2 / ADR-013). Explicit Gin
 			// routes so /admin wins over Huma and over the app NoRoute SPA.
-			mountAdminSPA(app.router, adminui.FS(), app.cfg.API.Prefix)
+			mountAdminSPA(app.router, adminui.FS(), app.cfg.API.Prefix, app.spaStorageOrigins()...)
 		}
 	}
-	mountEmbeddedFrontend(app.router, app.embeddedFrontend, app.cfg.API.Prefix)
+	if app.embeddedFrontend != nil {
+		mountEmbeddedFrontend(app.router, app.embeddedFrontend, app.cfg.API.Prefix, app.spaStorageOrigins()...)
+	}
 
 	// A /readyz datastore probe exists only when a database is attached
 	// (HOST-2 / ADR-015). Apps with no datastore are ready on the drain flag
 	// alone.
 	if app.readyProbe == nil && app.db != nil && app.db.DB != nil {
 		app.readyProbe = app.pingDatabase
+	}
+
+	// Database logging goes through the app's logger, so it honors
+	// GOMBIT_LOG_SINK / GOMBIT_LOG_LEVEL and never prints parameter values
+	// (issue #439). Done last: the database is the caller's, and a New that
+	// fails must not leave it logging through an app that never ran. A GORM
+	// logger the caller set on it is kept.
+	if app.db != nil {
+		app.db.ReplaceDefaultLogger(database.NewLogger(app.logger.Named("database")))
 	}
 
 	return app, nil
@@ -541,34 +588,40 @@ func Run(app *App) error {
 	return RunContext(ctx, app)
 }
 
-// RunContext runs app until ctx is canceled or the HTTP server fails.
+// RunContext runs app until ctx is canceled or the HTTP server fails. Every
+// return runs the stop hooks and closes what the app opened, so an App runs
+// once: it cannot be run again after RunContext returns (issue #435).
 func RunContext(ctx context.Context, app *App) error {
-	if ctx == nil {
-		return errors.New("framework: nil context")
-	}
 	if app == nil {
 		return errors.New("framework: nil app")
+	}
+	if ctx == nil {
+		return errors.Join(errors.New("framework: nil context"), app.runStopHooks())
 	}
 
 	listener, err := net.Listen("tcp", app.Config().HTTP.Addr)
 	if err != nil {
-		return fmt.Errorf("framework: listen: %w", err)
+		return errors.Join(fmt.Errorf("framework: listen: %w", err), app.runStopHooks())
 	}
 
 	// The per-handler context deadline (HTTP.RequestTimeout) is opt-in and off by
 	// default (issue #270), but the connection-level timeouts are a safety net
-	// that must stay on. When RequestTimeout is set it still drives all three;
-	// when it is disabled they fall back to defaultHTTPServerTimeout rather than 0
-	// (unbounded).
+	// that must stay on. When RequestTimeout is set it drives all three, and the
+	// write timeout gets requestTimeoutWriteGrace on top so the handler's own
+	// timeout response can still be written (issue #430); when it is disabled
+	// they fall back to defaultHTTPServerTimeout rather than 0 (unbounded), and
+	// there is no handler deadline to outlast.
 	serverTimeout := app.Config().HTTP.RequestTimeout
+	writeTimeout := serverTimeout + requestTimeoutWriteGrace
 	if serverTimeout <= 0 {
 		serverTimeout = defaultHTTPServerTimeout
+		writeTimeout = defaultHTTPServerTimeout
 	}
 	server := &http.Server{
 		Handler:           app.Router(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       serverTimeout,
-		WriteTimeout:      serverTimeout,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       serverTimeout,
 	}
 	app.setServer(server, listener.Addr().String())
@@ -649,22 +702,24 @@ func (a *App) shutdown() error {
 		<-timer.C
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
+	// The HTTP drain and the stop hooks get separate budgets (issue #431). A
+	// request that outlives the drain consumes all of its context, and hooks
+	// handed that same context would start with it already expired: any hook
+	// that honors its context (flush a buffer, close a pool) would fail at once,
+	// exactly when shutdown is already going badly. runStopHooks gives them their
+	// own shutdownTimeout, as the worker's shutdown already does.
+	var drainErr error
 	if server != nil {
-		if err := server.Shutdown(shutdownCtx); err != nil {
+		drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		err := server.Shutdown(drainCtx)
+		cancel()
+		if err != nil {
 			_ = server.Close()
-			return errors.Join(
-				fmt.Errorf("framework: shutdown: %w", err),
-				a.runStopHooksWithContext(shutdownCtx),
-				a.closeOwnedJobs(),
-				a.closeOwnedCache(),
-			)
+			drainErr = fmt.Errorf("framework: shutdown: %w", err)
 		}
 	}
 
-	return errors.Join(a.runStopHooksWithContext(shutdownCtx), a.closeOwnedJobs(), a.closeOwnedCache())
+	return errors.Join(drainErr, a.runStopHooks())
 }
 
 func (a *App) runStopHooks() error {
@@ -674,7 +729,13 @@ func (a *App) runStopHooks() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return errors.Join(a.runStopHooksWithContext(ctx), a.closeOwnedJobs(), a.closeOwnedCache())
+	return errors.Join(a.runStopHooksWithContext(ctx), a.releaseOwned())
+}
+
+// releaseOwned closes the job dispatcher and cache the app opened itself, in
+// that order (see closeOwnedJobs). Each is closed at most once.
+func (a *App) releaseOwned() error {
+	return errors.Join(a.closeOwnedJobs(), a.closeOwnedCache())
 }
 
 func (a *App) closeOwnedCache() error {
@@ -726,6 +787,10 @@ func syncLogger(logger *zap.Logger) error {
 func newRouter(cfg config.Config, csrfExemptPaths, rawBodyPaths []string, readyz gin.HandlerFunc, extraMetrics func(context.Context, io.Writer)) (*gin.Engine, *storageRoute, error) {
 	router := gin.New()
 	enableMethodNotAllowed(router)
+	// Unmatched paths get the D10 404 (issue #438). WithEmbeddedFrontend
+	// replaces this NoRoute with the SPA fallback, which answers reserved and
+	// API paths the same way.
+	router.NoRoute(abortNotFound)
 	if err := configureTrustedProxies(router, cfg.HTTP.TrustedProxies); err != nil {
 		return nil, nil, err
 	}
@@ -902,7 +967,7 @@ func configureTrustedProxies(engine *gin.Engine, proxies []string) error {
 
 func runtimeMiddlewareStack(cfg config.Config, metrics *httpMetrics, csrfExemptPaths, rawBodyPaths []string, route *storageRoute) []namedMiddleware {
 	stack := []namedMiddleware{
-		{name: "recovery", handler: gin.Recovery()},
+		{name: "recovery", handler: recoverWithEnvelope()},
 		// request_context also imposes the per-handler timeout (issue #268): the
 		// two IDs and the deadline ride one Request.WithContext, and the former
 		// standalone request_timeout layer is gone.

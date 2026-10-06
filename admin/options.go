@@ -1,6 +1,9 @@
 package admin
 
-import "github.com/gombit-dev/gombit/field"
+import (
+	"github.com/gombit-dev/gombit/field"
+	"github.com/gombit-dev/gombit/storage/upload"
+)
 
 // Admin meta type strings. These are the admin projection of field.Kind
 // (see docs/fields.md). Do not add a wire string that package field does
@@ -19,6 +22,11 @@ const (
 	TypeUUID     FieldType = FieldType(field.UUID)
 	TypeJSON     FieldType = FieldType(field.JSON)
 	TypeRelation FieldType = FieldType(field.Relation)
+	// TypeFile and TypeImage are storage-backed: the column holds an object
+	// key; rows carry a file object; writes take the key of an upload
+	// granted by the admin's upload endpoint.
+	TypeFile  FieldType = FieldType(field.File)
+	TypeImage FieldType = FieldType(field.Image)
 )
 
 // Relation kinds for v1. Defined in package field.
@@ -100,12 +108,22 @@ type Field struct {
 	// when the column is not an enum.
 	Choices []Choice `json:"choices,omitempty"`
 	// Column is the GORM/SQL column name. Empty means Name == JSON key ==
-	// column (the v1 default). Not emitted in meta.
+	// column (the v1 default). When set, it alone picks the model field the
+	// admin reads and writes (Name is then only the JSON key); a column the
+	// model does not have is a registration error. Not emitted in meta.
 	Column string `json:"-"`
 	// WriteOnly matches a public create field that is omitted from the
 	// response (`gombit:"write"`). Row payloads leave it out. An update
 	// applies it only when the body contains a new value.
 	WriteOnly bool `json:"writeonly,omitempty"`
+	// Accept and MaxBytes are a file or image field's upload policy (the
+	// model's storage tag): the media types it accepts and its largest
+	// file. Set at registration; the admin form uses them as hints, and
+	// the server enforces them.
+	Accept   []string `json:"accept,omitempty"`
+	MaxBytes int64    `json:"max_bytes,omitempty"`
+	// policy is the file field's full upload policy (prefix included).
+	policy *upload.Policy
 }
 
 // Choice is one enum entry: the stored value and the label the admin shows.

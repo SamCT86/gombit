@@ -7,7 +7,13 @@ OpenAPI routes (`/openapi.json` and siblings), `/docs` when
 `API.DocsEnabled` is true, and — when `GOMBIT_JWT_SECRET` is set and a
 database is attached — the auth routes (`<prefix>/auth/*`, `<prefix>/me`, where
 `<prefix>` is `API.Prefix`, `/api/v1` by default; cookie mode also mounts the
-admin API and `/admin/`).
+admin API and `/admin/`). For the local and memory storage drivers it also
+mounts the storage route `GOMBIT_STORAGE_LOCAL_URL/*key` (`/_storage` by
+default) when the drivers have URLs: a non-empty `GOMBIT_STORAGE_LOCAL_URL`
+and a secret to sign them with (`GOMBIT_STORAGE_URL_SECRET`, or one derived
+from `GOMBIT_JWT_SECRET`). There, `GET`/`HEAD` serve signed and public file
+URLs, and `PUT` takes direct uploads (see
+[storage.md § Visibility and URLs](storage.md#visibility-and-urls)).
 Public API handlers register on `app.API()` (see [`docs/contract.md`](contract.md));
 raw Gin routes continue to use `app.Router()`.
 
@@ -64,6 +70,15 @@ Recovery
     -> feature handler
 ```
 
+A direct upload to the storage route (a `PUT` under the path `New` mounted it
+at) skips three layers. It skips the body size limit, since its signed URL
+bounds the length, and sanitization, since the file is stored byte for byte.
+It also skips CSRF, because the signed URL alone authorizes it, as a
+presigned S3 URL does. Nothing else under that path is exempt. With
+`WithStorage`, `New` mounts no storage route. With `WithRouter`, it still
+mounts the route on the app's router, but the middleware is the app's own,
+so the app exempts those uploads from its own CSRF check and body limit.
+
 The **request timeout is opt-in** (issue #270 / PERF-12). The framework default
 is `0`, which disables the per-handler deadline. The deadline lives inside the
 `request_context` middleware (#268 folded it in — there is no separate timeout
@@ -72,7 +87,10 @@ timer, nothing added on the request path. Set
 `GOMBIT_HTTP_REQUEST_TIMEOUT` (scaffolded apps set `60s`) to install it; the
 deadline then propagates into the request context and any DB/cache call that
 honors it. The `http.Server` `ReadHeaderTimeout`/`ReadTimeout`/`WriteTimeout`/
-`IdleTimeout` remain the connection-level safety net either way. Trade-off: with
+`IdleTimeout` remain the connection-level safety net either way. With the
+deadline set, `WriteTimeout` is the request timeout plus 5s, so a handler that
+returns at its deadline can still write its timeout response (a 504 with the
+D10 envelope) before the connection's write deadline closes it. Trade-off: with
 the per-handler deadline off, a slow handler keeps running after `WriteTimeout`
 closes the connection, and a long-running DB query is not cancelled unless the
 app enables the timeout or sets its own deadline. See
@@ -133,6 +151,18 @@ Other behavior notes (they describe the opt-in layer):
 - Incomplete angle brackets that are not a complete HTML tag (no closing `>`,
   e.g. a product name `a<b`) are left unchanged — the HTML tokenizer would
   otherwise treat `"<"+letter` as a start tag and silently shorten the string.
+  That holds even when the value also carries a real tag: in
+  `<i>note</i>: if a<b then stop` the `<i>` tags are stripped and
+  `if a<b then stop` is kept, and so is a trailing `</3`, an unclosed `<!--`
+  or `<!DOCTYPE`. That tail, from the stray `<` to the end of the value, comes
+  back exactly as `SanitizeHTML` returns it on its own: verbatim when the
+  `completeHTMLTag` pattern finds no tag in it, dropped otherwise. It is the
+  same check as above, not a browser-level guarantee: an unterminated tag in
+  the tail keeps its attributes (`a<b onclick=f() c` is returned as is), and
+  becomes live markup if the value is later spliced into HTML before a `>`.
+  The tail is also raw input, so its entities stay encoded while the text
+  before it is decoded (`<b>A&amp;B</b> x<y &amp; z` gives `A&B x<y &amp; z`).
+  Escape on output; sanitization is a backstop.
   This applies to the submitted value itself, not to text recovered from
   inside an unclosed dangerous element. That text is unparsed markup rather
   than something the user typed, so it is re-parsed in full: every `"<"` +

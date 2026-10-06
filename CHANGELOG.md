@@ -134,9 +134,145 @@ version.
   - `examples/storage` gains `POST /uploads/direct` and
     `POST /uploads/direct/:id/confirm`
     ([#328](https://github.com/gombit-dev/gombit/issues/328)).
+- Object metadata and cleanup semantics (STORAGE-7):
+  - `ObjectInfo` documents what each field means (an opaque `ETag`, never a
+    checksum to compute; `ModTime`), and gains `StoredFilename()`;
+    `upload.File.Filename` is unchanged;
+  - `storage.Lister` (local, memory, S3) enumerates objects under a prefix,
+    with its own conformance check;
+  - `storage/claims` is the ownership protocol for stored files: a
+    `storage_claims` table (in new apps' migrations) where each key is
+    `pending`, `held` by a record, or `deleting`, moved by conditional
+    updates:
+    - `upload.Policy.Claims` claims each generated key before anything is
+      stored, and deletes a failed upload only while its key is pending (a
+      refused `Confirm` never deletes a held file);
+    - `CreateWith` holds a record's keys in the transaction that writes it
+      and abandons the uploads otherwise, unless a key turns out held (a
+      commit whose answer was lost, a retried confirmation);
+    - `Update` holds new keys and releases replaced ones in the record's
+      transaction, deleting the replaced files once it commits;
+    - `DeleteWith` releases the keys with the record's delete, then deletes
+      the files (a key with no claim is left alone);
+    - `Sweep` abandons stale pending claims and finishes interrupted
+      deletes. It reads claims only, so a file without one is never
+      deleted;
+    - every claim has a lease, the time after which no writer the
+      application controls publishes under its key: `upload.Save`/`Receive`
+      run their `Put` under it (`Policy.UploadTimeout`, an hour by
+      default). A deleting claim stays as a tombstone until its lease has
+      ended, and each sweep deletes its file again, so an upload that
+      publishes after its claim was abandoned is still deleted;
+    - direct uploads under claims are staged: `upload.Authorize` grants a
+      `PUT` to `_staging/<key>` (`upload.StagingKey`), and `upload.Confirm`
+      promotes the claim (`pending → promoting`, won by one confirmation),
+      checks the staged object, and publishes a copy at the key. A client
+      never writes a claimed key, so a presigned S3 `PUT` that ends late
+      only publishes a staging object. On S3, `Save`/`Receive` under claims
+      stage too. The app's storage route also aborts a signed `PUT` at
+      `storage.SignedUploadTimeout` (an hour) after its URL expired;
+    - promotion is fenced: the copy is prepared (`storage.PreparePublish`:
+      on S3 a multipart upload with server-side part copies, publishing
+      nothing), its token recorded on the claim (`claims.Publishing`), then
+      published (`storage.Publish`). A claim with a recorded copy is never
+      forgotten until `storage.Fence` (on S3, aborting the upload) proves
+      it can no longer publish, so a copy of unknown outcome cannot
+      complete after its claim is gone;
+    - `_staging/` is a reserved namespace: `claims.SweepStaging` deletes
+      any object there whose key has no live claim, whoever stored it (a
+      bucket lifecycle rule on `_staging/` is an optional backstop);
+    - `storage.Publisher` (S3: a multipart upload with server-side part
+      copies, completed with the ETags S3 returned for them, its token
+      bounded by construction, a failure returning a cleanup-only token;
+      fenced by aborting, which proves the copy is never published and
+      needs only `s3:AbortMultipartUpload`, then, best effort, re-aborting
+      while parts are listed; `s3.Config.Warn` reports what it could not
+      free) with `storage.PreparePublish` /
+      `Publish` / `Fence`, with a conformance check;
+    - only an ownable store takes part: a `storage.Publisher` or a
+      `storage.BoundedWriter` (local, memory: writes end with their
+      calls). Claims, uploads under claims, and the publication helpers
+      refuse any other store with `storage.ErrUnsupported`
+      (`storage.CheckOwnable`).
+  - `examples/storage` records its uploads in SQLite under claims, deletes
+    them with their records, and sweeps the rest
+    ([#329](https://github.com/gombit-dev/gombit/issues/329)).
+- Storage-backed model fields (MODEL-8):
+  - `file` and `image` field kinds (`types.File`, `types.Image`) store an
+    object key, never bytes. The column has a unique index, so one record
+    owns each file.
+  - A `storage:"prefix=...;max_bytes=...;types=..."` tag sets the field's
+    upload policy.
+  - `gombit generate` emits:
+    - an upload-grant operation per file field;
+    - create checks: the key must be a confirmed upload under the field's
+      prefix, passing the policy by its bytes, claimed for that field (each
+      policy's `Scope`, `"<package>.<column>"`), and the insert holds its
+      claim in the same transaction (`storage/claims`), so another field's
+      grant, another record's file or an expired upload is refused and a
+      failed insert deletes the uploads;
+    - reads that return `{key, filename, size, content_type, url}`.
+  - The generated forms upload the chosen file directly to storage on every
+    submit (never reusing a key from a failed attempt), and the lists link
+    to it.
+  - `storage/claims` claims record a scope (`upload.Policy.Scope`);
+    `upload.Confirm` accepts only a key claimed for its policy's scope
+    (`claims.Promote` matches it, new `claims.Lookup`); a key with no live
+    claim (expired, swept, discarded by a failed write, never granted) is
+    `upload.ErrExpired`, told apart from another field's key.
+  - The runtime is `storage/filefield`.
+  - Admin support (file widget, uploads, deletion through the claims)
+    comes with STORAGE-8, below.
+  - `examples/storage` gains a `Document` resource
+    ([#530](https://github.com/gombit-dev/gombit/issues/530)).
+- Admin support for storage-backed fields (STORAGE-8):
+  - `file` and `image` admin types; the meta carries each field's `accept`
+    and `max_bytes`;
+  - rows carry file objects with download URLs;
+  - an explicit `Options.Fields` entry for a file or image column must be
+    declared `file` or `image` (any other type is a registration error, so
+    no admin write bypasses the upload protocol);
+  - an explicit `Field.Column` alone picks the model field the admin reads
+    and writes (it used to race `Name` in schema order), so the file guards
+    and the accessors agree on one column;
+  - updates and deletes are fenced on the file keys they loaded (empty ones
+    included): a concurrent attach, replacement or removal of a file makes
+    them a 409 with nothing written (a delete's 409 is no longer a 500), and
+    an update leaves unchanged and unmapped file columns out of the write;
+  - a blank key (`""`, or a file object whose `key` is `""`) is no file, so
+    a required file field refuses it on create and update; a malformed file
+    object (no key, a null or non-string one) is a 422, never a removal;
+  - an explicit file field must be declared as its column's own kind
+    (`image` for an image column), and file fields need the host's storage;
+  - a file column the admin does not map (hidden, or left out of explicit
+    `Fields`) turns delete off, and create when it is required; asking for
+    either is a registration error;
+  - an upload a failed save discarded is reported as expired ("choose the
+    file again", `upload.ErrExpired`), not as another field's, and the SPA
+    drops the uploads of any failed save from the form and asks for them
+    again;
+  - `POST /admin/resources/{slug}/uploads/{field}` grants a direct upload,
+    and needs create or update permission;
+  - writes accept a key only for an upload under the field's prefix that
+    passes its policy, and hold its claim in the write's transaction
+    (`storage/claims`), so another record's file is refused;
+  - files replaced, removed, or taken with a deleted record are released in
+    that transaction and deleted once it commits; a failed write abandons
+    its new uploads;
+  - the SPA's file widget uploads, previews images, and removes, and lists
+    and detail pages link files;
+  - the admin and embedded SPA pages allow the store's origin in their
+    Content-Security-Policy;
+  - `examples/admin` gains a `Brochure` model
+    ([#330](https://github.com/gombit-dev/gombit/issues/330)).
 
 ### Changed
 
+- A new app's README lists `storage/` (the local driver's files, created on
+  the first write and gitignored) and says `internal/platform` migrates the
+  framework's tables (auth, storage claims). The README, the docs index, and
+  the user guides (router, security, build, lifecycle, health, frontend,
+  contract, CLI, tutorial) now cover the shipped storage feature.
 - A new app's `.env.example` lists every `GOMBIT_*` variable the config
   package reads, including `GOMBIT_JOBS_DRIVER`, `GOMBIT_JOBS_QUEUE`,
   `GOMBIT_JOBS_NAMESPACE`, `GOMBIT_HTTP_TRUSTED_PROXIES`, and the database
@@ -163,6 +299,167 @@ version.
   now fails `Register` at startup instead of writing the wrong row. Give such
   a model a single-column primary key, or keep it out of the admin registry
   ([#453](https://github.com/gombit-dev/gombit/issues/453)).
+- With `GOMBIT_HTTP_REQUEST_TIMEOUT` set, the response a handler writes when
+  its request deadline fires (a 504 with the D10 envelope) now reaches the
+  client. The `http.Server` `WriteTimeout` equalled the request timeout and
+  is armed before the handler's context is created, so it always expired
+  first and the client saw the connection close (`EOF`). `WriteTimeout` is now
+  the request timeout plus 5s; with the timeout unset the server timeouts are
+  unchanged ([#430](https://github.com/gombit-dev/gombit/issues/430)).
+- `framework.SanitizeHTML` (and `Security.SanitizeInput`) no longer deletes
+  plain text after a stray `<` when the value also carries a real tag:
+  `<i>note</i>: if a<b then stop` used to become `note: if a`, and a `</3`
+  or unclosed `<!--` ate the rest of the value. That tail now comes back
+  exactly as `SanitizeHTML` returns it on its own (the existing check for a
+  value with no complete tag), so it is kept as raw, undecoded input; it is
+  no safer than that check, and complete tags elsewhere are still stripped
+  ([#433](https://github.com/gombit-dev/gombit/issues/433)).
+- HTML documents in an embedded frontend other than the root `index.html`
+  (`/legal.html`, a multi-page build's `/about/index.html`) are served with
+  the SPA browser security policy instead of the API one, whose
+  `default-src 'none'` blocked the page's scripts, styles and images. The
+  policy now follows the served content type, not the file name
+  ([#434](https://github.com/gombit-dev/gombit/issues/434)).
+- Decimals are no longer silently changed on write. On SQLite, which stores a
+  `decimal` column through float64, `99999999999999.9999` used to become
+  `100000000000000`; PostgreSQL and MySQL rounded a value over the column's
+  scale. Every create, upsert, and update now refuses, with a 422 naming the
+  field, a value written to a decimal column (in any Go shape: decimal,
+  string, number, pointer, named type, `sql.Null*`) that does not fit the
+  column's `decimal(p,s)` as GORM emits it (MySQL's `DECIMAL(10,0)` when
+  none is declared), that is not a decimal number, or on SQLite that has
+  more than 15 digits (`database.SQLiteDecimalDigits`). An update that does
+  not write a decimal column is not affected by the row's existing value. A
+  decimal whose exponent is beyond ±1000 or that spells more than 1000 digits
+  (`types.MaxDecimalDigits`, e.g. `"1e1000000000"` or `"0e1000000000"`) is
+  refused when parsed, scanned, and before any write, instead of pinning a CPU
+  while it is formatted. **Behavior change:** a decimal field whose column type
+  is neither decimal nor text (`type:real`, `type:double precision`,
+  `type:money`, `type:bigint`) now fails every write with an error; declare it
+  `decimal(p,s)`. A string written to a text decimal column must be the
+  canonical spelling (`"1.5"`, not `" 1.5 "` or `"1.50"`). A `types.Decimal`
+  now refuses to load a stored value over 1000 digits (possible in an
+  unbounded PostgreSQL `numeric`), and a non-finite float. The generated
+  create handler now responds with the stored row, so its body is what a get
+  returns; run `gombit generate` to pick that up in an existing app
+  ([#440](https://github.com/gombit-dev/gombit/issues/440)).
+- Unknown paths and recovered handler panics now answer with the D10 error
+  envelope like every other framework error. A 404 used to be Gin's
+  `text/plain` "404 page not found" (or an empty body under an embedded
+  frontend), and a panic an empty 500 with no `Content-Type`, so JSON clients
+  such as the generated TypeScript client failed to parse them and got no
+  `request_id`. They are now `not_found` (404) and `internal` (500)
+  ([#438](https://github.com/gombit-dev/gombit/issues/438)).
+- `cache.WithJanitor` with a zero or negative interval no longer crashes the
+  process. The value reached `time.NewTicker` inside the janitor goroutine,
+  whose panic the caller could not recover; it now means no janitor, as if
+  the option were omitted
+  ([#436](https://github.com/gombit-dev/gombit/issues/436)).
+- The benchmark report no longer publishes a snapshot from a developer host
+  as if it were the canonical run. A clean tree on the canonical protocol used
+  to render with no banner whatever machine ran it. Each measured unit now
+  records the operator's `BENCHMARK_HOST_CLASS` declaration as `host_class`,
+  and `make benchmark-report` stamps the README block "Not measured on
+  dedicated hardware" unless every published unit declares `dedicated`. An
+  undeclared host counts as not dedicated, so the committed snapshot now
+  carries the banner. The declaration must be `dedicated`, `developer` or
+  unset; the `make benchmark-*` targets and every producer refuse any other
+  value before measuring ([#291](https://github.com/gombit-dev/gombit/issues/291)).
+- `OnStop` hooks get their own shutdown-timeout budget instead of what the
+  HTTP drain left over. A request that outlived the shutdown timeout used to
+  hand every stop hook an already-expired context, so a hook that honors its
+  context (flush a buffer, close a pool) failed at once. A full shutdown can
+  now take the drain delay plus up to twice the shutdown timeout
+  ([#431](https://github.com/gombit-dev/gombit/issues/431)).
+- A request whose handler panics is now counted in
+  `gombit_http_requests_total` and `gombit_http_request_duration_seconds_sum`
+  with `status="500"`. The metrics layer recorded a request only after the
+  handler returned, so a panic unwound past it and the request never appeared
+  in `/metrics`. A handler that had already sent its status before panicking
+  is counted at that status; one that only set it is counted as 500, which is
+  what the client receives. A panic that aborts the connection
+  (`http.ErrAbortHandler`) before anything is sent is also counted as 500
+  ([#432](https://github.com/gombit-dev/gombit/issues/432)).
+- A list page so far out that its offset overflows is empty. `contract.PageOffset`
+  computed `(page - 1) * per_page` unchecked, so `?page=9223372036854775807`
+  wrapped to a negative offset, which GORM ignores, and returned the first
+  page's rows under that page number on every generated list endpoint and the
+  admin data plane. The offset now saturates at `math.MaxInt`, which selects
+  nothing on SQLite, PostgreSQL and MySQL
+  ([#441](https://github.com/gombit-dev/gombit/issues/441)).
+- Database logging goes through the app's logger instead of GORM's default
+  one, which wrote to stdout in its own coloured format, ignored
+  `GOMBIT_LOG_SINK` / `GOMBIT_LOG_LEVEL`, logged every failed statement with
+  its parameter values inlined (a duplicate registration printed the user's
+  bcrypt hash and email), and reported every not-found lookup as an error.
+  Statements, not-found lookups and the failures the API answers with a 4xx
+  (identified by the driver's error code, never by text) are logged at
+  `debug`, slow statements at `warn`, and every other failure at `error`; the
+  logged SQL keeps its placeholders and never carries parameter values,
+  `Scan` included (`database.Open` sets GORM's process-wide
+  `logger.RecorderParamsFilter`). `database.Open` without an app installs a quiet stderr logger with
+  the same guarantee; a GORM logger the app sets on its database is kept. New:
+  `database.NewLogger`, `database.SlowQueryThreshold` and
+  `(*database.DB).ReplaceDefaultLogger`
+  ([#439](https://github.com/gombit-dev/gombit/issues/439)).
+- The in-memory cache's `Increment` refuses to overflow, as Redis `INCRBY`
+  does: incrementing past `math.MaxInt64` (or below `math.MinInt64`) returns
+  an "increment or decrement would overflow" error and leaves the value as it
+  was. It used to wrap silently, so a counter that reached the top flipped to
+  a huge negative number under the memory driver and failed under Redis.
+  A stored `nil` is now refused as not an integer too, as Redis refuses it,
+  instead of being overwritten with the delta
+  ([#437](https://github.com/gombit-dev/gombit/issues/437)).
+- A failed `framework.New` closes the cache and job dispatcher it had already
+  opened. It returned the error without them, and the caller never received
+  the `*App` to close them, so each failure left the in-memory cache's janitor
+  goroutine (or a Redis pool) running for the life of the process. A cache or
+  dispatcher passed in with `WithCache` / `WithJobs` is still the caller's.
+  `RunContext`, `RunWorker` and `Run`'s worker mode now run the stop hooks once
+  and close those resources on every return, including the ones before
+  serving: a listener that cannot bind, a nil context, refused worker
+  options, flags or driver, and worker mode's `-h`. An `App` runs once; it
+  cannot be run again after any of them returns
+  ([#435](https://github.com/gombit-dev/gombit/issues/435)).
+- Every database write refuses a timestamp or date no supported driver can
+  store and return, with a 422 on that field. Any RFC 3339 timestamp was
+  accepted: Postgres stored `0000-01-01T00:00:00Z` as 1 BC, after which the
+  row's endpoint and every list page holding it could no longer be read, and
+  MySQL refused it with a 500. `database.Open` now registers a
+  `gombit:timerange` callback, next to the `Validate` hook, that checks every
+  `time.Time`, `sql.NullTime` and `types.Date` value a create or update writes
+  (`Create`, `Save`, `Updates`, `Update`, `UpdateColumns`, upsert
+  `DO UPDATE` literals, honouring `Select`/`Omit`) against
+  `1000-01-02T00:00:00Z`..`9999-12-30T23:59:59Z` (a day's margin for the time
+  zone a value is read into) and `1000-01-01`..`9999-12-31`
+  (`types.TimeBounds`, `types.DateBounds`, `types.TimeWithin`,
+  `types.DateWithin`). It covers the generated API, the admin data plane and
+  custom code alike, with no regeneration, and adds no allocation to an
+  ordinary write. **Behaviour change:** a zero `time.Time` a write sets (a
+  non-pointer field left unset on create, a zero in a map, `Update` or a
+  `Select` naming the column) is now a 422 on every driver; it was stored on
+  SQLite/PostgreSQL and a 500 on MySQL. Use a pointer for an optional time.
+  `Save` of a struct with an unset `CreatedAt` or defaulted column leaves
+  that column out of its update (the row's value stays; the insert fallback
+  fills it). Rows that already store the zero instant stay editable through
+  `Update`, a partial `Updates` and the admin, which keeps a stored zero in
+  any column a PATCH does not set unless a hook repairs it
+  (`database.StoredZeroColumns`, `database.KeepStoredZeros`); a generic
+  `Save` of one is a 422 until the column is cleaned up
+  (see docs/database.md). A string no Go time parses (`'infinity'`) is refused too
+  ([#443](https://github.com/gombit-dev/gombit/issues/443)).
+- A response that cannot be encoded as JSON is answered with HTTP 500 and the
+  D10 `internal` envelope (with the request ID), and logged through the app's
+  logger. Huma decided the status before encoding, so a stored time outside
+  years 0..9999 or a float holding NaN/±Inf produced HTTP 200, a JSON content
+  type, and the plain-text body "error marshaling response", on the row's own
+  endpoint and every list page containing it. `encoding/json` writes nothing
+  until it has encoded the whole body, so Gombit's JSON format
+  (`contract.JSONFormat`) now answers such a failure itself while Gin still
+  holds the status, instead of handing it back to Huma. Outside
+  `framework.New`, `contract.HumaConfigFor` logs the failure through `slog`; a
+  writer on which the status cannot be confirmed to change gets the error back
+  to Huma as before ([#442](https://github.com/gombit-dev/gombit/issues/442)).
 
 ## [0.6.0] — 2026-09-28
 

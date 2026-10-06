@@ -233,7 +233,7 @@ func TestDirtyTreeStampsUnpublishable(t *testing.T) {
 
 func TestCanonicalCleanRunHasNoBanner(t *testing.T) {
 	out := Render(nil, nil, nil, canonicalMeta())
-	for _, unwanted := range []string{"UNPUBLISHABLE", "Reduced development snapshot"} {
+	for _, unwanted := range []string{"UNPUBLISHABLE", "Reduced development snapshot", hostBanner} {
 		if strings.Contains(out, unwanted) {
 			t.Errorf("a clean canonical run must carry no %q banner:\n%s", unwanted, out)
 		}
@@ -246,7 +246,8 @@ func TestReducedProtocolIsLabelled(t *testing.T) {
 	meta.Trials = 3
 	meta.DurationSeconds = 10
 	meta.WarmupSeconds = 3
-	out := Render(nil, nil, nil, meta)
+	// A snapshot that records no unit: its top-level protocol is every row's.
+	out := Render([]result.Result{crudRow("gombit", 100, 1, 1000, 5, 10, 20)}, nil, nil, meta)
 	if !strings.Contains(out, "Reduced development snapshot") {
 		t.Errorf("a narrower-than-canonical run must be labelled reduced:\n%s", out)
 	}
@@ -269,12 +270,199 @@ func TestReducedProtocolIsLabelled(t *testing.T) {
 // The pre-run placeholder (no protocol recorded) must NOT be mislabelled as a
 // reduced snapshot — there is nothing to compare against canonical yet.
 func TestEmptyProtocolIsNotReduced(t *testing.T) {
-	if reduced, _ := reducedFrom(metadata.Metadata{}); reduced {
+	if reduced, _ := reducedFrom(protocolsOf(metadata.Metadata{}, []string{crudUnit("gombit")})); reduced > 0 {
 		t.Error("empty metadata should not be classified as a reduced snapshot")
 	}
 	out := Render(nil, nil, nil, metadata.Metadata{})
 	if strings.Contains(out, "Reduced development snapshot") {
 		t.Errorf("empty render must not carry the reduced banner:\n%s", out)
+	}
+}
+
+// protocolOf is the protocol a run-crud invocation files on its unit.
+func protocolOf(conc []int, trials int, duration, warmup float64) *metadata.RunParams {
+	return &metadata.RunParams{
+		Concurrency: conc, Trials: trials, DurationSeconds: duration, WarmupSeconds: warmup,
+		BenchmarkTool: "grafana/k6:0.55.0",
+	}
+}
+
+func canonicalProtocol() *metadata.RunParams {
+	return protocolOf(append([]int(nil), CanonicalProtocol.Concurrency...), CanonicalProtocol.Trials,
+		CanonicalProtocol.DurationSeconds, CanonicalProtocol.WarmupSeconds)
+}
+
+func methodologySection(out string) string {
+	return out[strings.Index(out, "### How these were measured"):]
+}
+
+// Two workloads recorded at different protocols in one snapshot: the published
+// crud-list table is described by, and judged on, its own protocol — not the
+// auth-jwt run that rewrote the top level last (#377).
+func TestEachTableIsDescribedByItsOwnUnitsProtocol(t *testing.T) {
+	clean := false
+	list := crudRow("gombit", 100, 1, 1000, 5, 10, 20)
+	auth := list
+	auth.Benchmark = "auth-jwt"
+
+	meta := canonicalMeta()
+	meta.Concurrency, meta.Trials, meta.DurationSeconds, meta.WarmupSeconds = []int{1}, 1, 5, 1
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, list.ProvenanceUnit(),
+		metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean, Protocol: canonicalProtocol()})
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, auth.ProvenanceUnit(),
+		metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean, Protocol: protocolOf([]int{1}, 1, 5, 1)})
+
+	out := Render([]result.Result{list, auth}, nil, nil, meta)
+	if strings.Contains(out, "Reduced development snapshot") {
+		t.Errorf("another workload's reduced run must not stamp the canonical crud-list table:\n%s", out)
+	}
+	how := methodologySection(out)
+	if !strings.Contains(how, "- **Protocol:** concurrency 1/10/100/500/1000 VUs, 5 trials × 30s each (warm-up 10s)") {
+		t.Errorf("the crud-list table must be described by its own protocol:\n%s", how)
+	}
+	if strings.Contains(how, "1 trial ") || strings.Contains(how, "per unit") {
+		t.Errorf("the auth-jwt protocol must not describe the crud-list table:\n%s", how)
+	}
+
+	// And the other way round: the canonical run recorded last cannot hide a
+	// reduced crud-list table.
+	meta.Concurrency, meta.Trials, meta.DurationSeconds, meta.WarmupSeconds =
+		append([]int(nil), CanonicalProtocol.Concurrency...), CanonicalProtocol.Trials,
+		CanonicalProtocol.DurationSeconds, CanonicalProtocol.WarmupSeconds
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, list.ProvenanceUnit(),
+		metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean, Protocol: protocolOf([]int{1, 10}, 2, 5, 1)})
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, auth.ProvenanceUnit(),
+		metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean, Protocol: canonicalProtocol()})
+	out = Render([]result.Result{list, auth}, nil, nil, meta)
+	if !strings.Contains(out, "Reduced development snapshot") || !strings.Contains(out, "2 trials (canonical 5 trials)") {
+		t.Errorf("a reduced crud-list table must be labelled whatever the top level says:\n%s", out)
+	}
+	if !strings.Contains(methodologySection(out), "- **Protocol:** concurrency 1/10 VUs, 2 trials × 5s each (warm-up 1s)") {
+		t.Errorf("the crud-list table must be described by its own reduced protocol:\n%s", methodologySection(out))
+	}
+}
+
+// One table whose apps ran under different protocols names each one's, in the
+// banner and in the methodology block, instead of picking one.
+func TestATableMixingProtocolsNamesEachUnits(t *testing.T) {
+	clean := false
+	meta := canonicalMeta()
+	// No top-level protocol, so the unit stamped without one stays unrecorded
+	// rather than inheriting it (see TestLegacyUnitsAreJudgedByTheTopLevelProtocol).
+	meta = meta.WithRunParams(metadata.RunParams{})
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, crudUnit("rails"),
+		metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean, Protocol: canonicalProtocol()})
+	reduced := protocolOf([]int{1, 10}, 1, 5, 1)
+	reduced.BenchmarkTool = "grafana/k6:0.99.0"
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, crudUnit("gombit"),
+		metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean, Protocol: reduced})
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, crudUnit("django"),
+		metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean})
+
+	out := Render([]result.Result{
+		crudRow("rails", 10, 1, 900, 5, 10, 20),
+		crudRow("gombit", 10, 1, 1000, 5, 10, 20),
+		crudRow("django", 10, 1, 800, 5, 10, 20),
+	}, nil, nil, meta)
+
+	if !strings.Contains(out, "Some CRUD rows were measured under a **narrower protocol") ||
+		!strings.Contains(out, "gombit:crud-list: concurrency 1/10 (canonical 1/10/100/500/1000), 1 trial (canonical 5 trials)") {
+		t.Errorf("the banner must name the unit that ran the reduced protocol:\n%s", out)
+	}
+	if strings.Contains(out, "rails:crud-list: ") {
+		t.Errorf("a canonical unit must not be listed as reduced:\n%s", out)
+	}
+	how := methodologySection(out)
+	for _, want := range []string{
+		"- **Protocol (per unit):** django:crud-list — not recorded; gombit:crud-list — concurrency 1/10 VUs, 1 trial × 5s each (warm-up 1s); rails:crud-list — concurrency 1/10/100/500/1000 VUs, 5 trials × 30s each (warm-up 10s)",
+		"- **Load generator (per unit):** django:crud-list — not recorded; gombit:crud-list — grafana/k6:0.99.0; rails:crud-list — grafana/k6:0.55.0.",
+	} {
+		if !strings.Contains(how, want) {
+			t.Errorf("methodology missing %q:\n%s", want, how)
+		}
+	}
+}
+
+// A CRUD unit stamped before protocols were per unit is described, and judged,
+// by the top-level protocol the README always attributed to it — the same answer
+// metadata.ReadJSON gives every producer. A reduced one must keep its banner.
+func TestLegacyUnitsAreJudgedByTheTopLevelProtocol(t *testing.T) {
+	clean := false
+	meta := canonicalMeta()
+	meta = meta.WithRunParams(*protocolOf([]int{1}, 1, 5, 1))
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, crudUnit("gombit"),
+		metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean})
+
+	out := Render([]result.Result{crudRow("gombit", 1, 1, 1000, 5, 10, 20)}, nil, nil, meta)
+	if !strings.Contains(out, "Reduced development snapshot") || !strings.Contains(out, "1 trial (canonical 5 trials)") {
+		t.Errorf("a legacy unit under a reduced top-level protocol must carry the banner:\n%s", out)
+	}
+	if !strings.Contains(methodologySection(out), "- **Protocol:** concurrency 1 VUs, 1 trial × 5s each (warm-up 1s)") {
+		t.Errorf("a legacy unit must be described by the top-level protocol:\n%s", methodologySection(out))
+	}
+}
+
+// Units that differ only in the load generator share one Protocol line; and when
+// every rendered unit ran a reduced protocol the banner says so.
+func TestProtocolAndLoadGeneratorCollapseIndependently(t *testing.T) {
+	clean := false
+	meta := canonicalMeta()
+	a, b := protocolOf([]int{1, 10}, 1, 5, 1), protocolOf([]int{1, 10}, 1, 5, 1)
+	b.BenchmarkTool = "grafana/k6:0.99.0"
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, crudUnit("rails"), metadata.Provenance{GitCommit: "a", GitDirty: &clean, Protocol: a})
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, crudUnit("gombit"), metadata.Provenance{GitCommit: "a", GitDirty: &clean, Protocol: b})
+
+	out := Render([]result.Result{crudRow("rails", 10, 1, 900, 5, 10, 20), crudRow("gombit", 10, 1, 1000, 5, 10, 20)}, nil, nil, meta)
+	how := methodologySection(out)
+	if !strings.Contains(how, "- **Protocol:** concurrency 1/10 VUs, 1 trial × 5s each (warm-up 1s)\n") {
+		t.Errorf("units sharing a protocol must share one Protocol line:\n%s", how)
+	}
+	if !strings.Contains(how, "- **Load generator (per unit):** gombit:crud-list — grafana/k6:0.99.0; rails:crud-list — grafana/k6:0.55.0.") {
+		t.Errorf("differing load generators must be named per unit:\n%s", how)
+	}
+	if !strings.Contains(out, "> Every CRUD row was measured under a ") {
+		t.Errorf("a table whose every unit is reduced must not say only some are:\n%s", out)
+	}
+}
+
+// sweep returns one framework's crud-list rows at every level of a sweep.
+func sweep(fw string, levels []int, trials int) []result.Result {
+	var rows []result.Result
+	for _, c := range levels {
+		for trial := 1; trial <= trials; trial++ {
+			rows = append(rows, crudRow(fw, c, trial, 1000, 5, 10, 20))
+		}
+	}
+	return rows
+}
+
+// The workflow per-unit protocols allow: one app re-run at a smoke sweep
+// without the headline concurrency while the others keep the canonical one. That
+// app has no row in the table, so the table must say it is missing, and its
+// protocol must still be named and judged (#377 review round 1).
+func TestAnAppWithoutTheHeadlineLevelIsNamedAndJudged(t *testing.T) {
+	clean := false
+	meta := canonicalMeta()
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, crudUnit("rails"),
+		metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean, Protocol: canonicalProtocol()})
+	meta = metadata.StampUnit(meta, metadata.GroupCRUD, crudUnit("gombit"),
+		metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean, Protocol: protocolOf([]int{1, 10}, 1, 5, 1)})
+
+	results := append(sweep("rails", CanonicalProtocol.Concurrency, CanonicalProtocol.Trials), sweep("gombit", []int{1, 10}, 1)...)
+	out := Render(results, nil, nil, meta)
+	crud := out[strings.Index(out, "### PostgreSQL CRUD read"):strings.Index(out, "### Operational footprint")]
+
+	if !strings.Contains(crud, "At **100 concurrent clients**") || strings.Contains(crud, "| gombit |") {
+		t.Fatalf("the table stays at the headline level, which gombit lacks:\n%s", crud)
+	}
+	if !strings.Contains(crud, "_**Not in this table** — no rows at 100 concurrent clients: gombit (measured at 1/10 VUs only)._") {
+		t.Errorf("an app with no row at the table's concurrency must be named, not dropped:\n%s", crud)
+	}
+	if !strings.Contains(out, "Reduced development snapshot") || !strings.Contains(out, "gombit:crud-list: concurrency 1/10") {
+		t.Errorf("the missing app's reduced protocol must still raise the banner:\n%s", out)
+	}
+	if !strings.Contains(methodologySection(out), "gombit:crud-list — concurrency 1/10 VUs, 1 trial × 5s each (warm-up 1s)") {
+		t.Errorf("the missing app's protocol must still be named:\n%s", methodologySection(out))
 	}
 }
 
@@ -602,10 +790,13 @@ func TestDirtyUnitStampsUnpublishableAndNamesOnlyThatGroupsTarget(t *testing.T) 
 	if !strings.Contains(banner, "UNPUBLISHABLE DEVELOPMENT RUN") {
 		t.Errorf("a unit measured on a dirty tree must stamp the block unpublishable:\n%s", banner)
 	}
-	if !strings.Contains(banner, "`make benchmark-micro benchmark-report`") {
+	// Judged on the dirty callout alone: the host-class callout below it names
+	// its own targets.
+	remedy := lineWith(banner, "dirty working tree")
+	if !strings.Contains(remedy, "`make benchmark-micro benchmark-report`") {
 		t.Errorf("remediation must name the dirty unit's group target:\n%s", banner)
 	}
-	if strings.Contains(banner, "benchmark-crud-all") {
+	if strings.Contains(remedy, "benchmark-crud-all") {
 		t.Errorf("remediation must not prescribe re-running the clean CRUD sweep:\n%s", banner)
 	}
 }
@@ -648,6 +839,117 @@ func TestDirtyTopLevelStillPrescribesTheWholeChain(t *testing.T) {
 		if banner := bannerOf(Render(nil, nil, nil, meta)); !strings.Contains(banner, rerunChain) {
 			t.Errorf("%s: must fall back to the full rerun chain:\n%s", name, banner)
 		}
+	}
+}
+
+const hostBanner = "Not measured on dedicated hardware"
+
+// dedicatedMeta is canonicalMeta with every unit the tables below publish
+// stamped as measured on a declared dedicated host at one clean commit.
+func dedicatedMeta(crudFrameworks ...string) metadata.Metadata {
+	meta := canonicalMeta()
+	clean := false
+	prov := metadata.Provenance{GitCommit: "abc123def456", GitDirty: &clean, HostClass: metadata.HostClassDedicated}
+	for _, s := range stackLadder {
+		meta = metadata.StampUnit(meta, metadata.GroupMicrobench, s.key, prov)
+	}
+	for _, fw := range crudFrameworks {
+		meta = metadata.StampUnit(meta, metadata.GroupCRUD, crudUnit(fw), prov)
+	}
+	return meta
+}
+
+// Issue #291: the canonical protocol on a clean tree used to publish
+// banner-free from a developer laptop. A unit that does not declare a dedicated
+// host must stamp the block, and saying nothing is not a declaration.
+func TestUndeclaredHostIsNotPublishedAsCanonical(t *testing.T) {
+	meta := canonicalMeta()
+	clean := false
+	for _, s := range stackLadder {
+		meta = metadata.StampUnit(meta, metadata.GroupMicrobench, s.key, metadata.Provenance{GitCommit: "abc123def456", GitDirty: &clean})
+	}
+	banner := bannerOf(Render(nil, nil, taxLadder(), meta))
+	if !strings.Contains(banner, hostBanner) {
+		t.Fatalf("a canonical clean run with no declared host class must be labelled:\n%s", banner)
+	}
+	for _, want := range []string{"`undeclared`", "BENCHMARK_HOST_CLASS=dedicated", "`make benchmark-micro benchmark-report`"} {
+		if !strings.Contains(banner, want) {
+			t.Errorf("host banner missing %q:\n%s", want, banner)
+		}
+	}
+}
+
+func TestDedicatedHostRunHasNoHostBanner(t *testing.T) {
+	meta := dedicatedMeta("rails")
+	// A unit no table publishes (the ablation ladder) says nothing about the
+	// numbers on the page, whatever host it ran on.
+	meta = metadata.StampUnit(meta, metadata.GroupMicrobench, "gombit-ablation", metadata.Provenance{HostClass: metadata.HostClassDeveloper})
+	out := Render([]result.Result{crudRow("rails", 100, 1, 900, 5, 10, 20)}, nil, taxLadder(), meta)
+	if banner := bannerOf(out); banner != "" {
+		t.Errorf("a clean canonical run on a declared dedicated host must carry no banner:\n%s", banner)
+	}
+}
+
+// One developer-host unit stamps the block and names only its group's target
+// and its own class.
+func TestDeveloperUnitNamesOnlyItsGroup(t *testing.T) {
+	meta := dedicatedMeta("rails")
+	clean := false
+	meta = metadata.StampUnit(meta, metadata.GroupMicrobench, "gin", metadata.Provenance{
+		GitCommit: "abc123def456", GitDirty: &clean, HostClass: metadata.HostClassDeveloper,
+	})
+	banner := bannerOf(Render([]result.Result{crudRow("rails", 100, 1, 900, 5, 10, 20)}, nil, taxLadder(), meta))
+	remedy := lineWith(banner, "dedicated benchmark hardware")
+	if remedy == "" {
+		t.Fatalf("a developer-host unit must stamp the block:\n%s", banner)
+	}
+	if !strings.Contains(remedy, "`developer`") || strings.Contains(remedy, "`undeclared`") {
+		t.Errorf("banner must name exactly the recorded class:\n%s", banner)
+	}
+	if !strings.Contains(remedy, "`make benchmark-micro benchmark-report`") || strings.Contains(remedy, "benchmark-crud-all") {
+		t.Errorf("banner must prescribe only the developer unit's group:\n%s", banner)
+	}
+}
+
+// An unrecognised class (a hand-edited or older metadata.json) still stamps the
+// block, but is never pasted into the Markdown, where a backtick or newline
+// would break it.
+func TestUnrecognisedHostClassIsNotEchoed(t *testing.T) {
+	meta := dedicatedMeta()
+	clean := false
+	meta = metadata.StampUnit(meta, metadata.GroupMicrobench, "gin", metadata.Provenance{
+		GitCommit: "abc123def456", GitDirty: &clean, HostClass: "dedicated`\n> injected",
+	})
+	banner := bannerOf(Render(nil, nil, taxLadder(), meta))
+	if !strings.Contains(banner, "recorded host class: an unrecognised value") {
+		t.Errorf("an unrecognised class must stamp the block and be named as such:\n%s", banner)
+	}
+	if strings.Contains(banner, "injected") {
+		t.Errorf("the raw class was echoed into the Markdown:\n%s", banner)
+	}
+}
+
+// collect-host-info rewrites the top level without measuring anything, so a
+// dedicated top level must not vouch for units recorded without a class. A
+// snapshot that records no unit at all is still judged by its top level.
+func TestHostClassIsJudgedPerUnitNotByTheTopLevel(t *testing.T) {
+	clean := false
+	rewritten := canonicalMeta()
+	rewritten.HostClass = metadata.HostClassDedicated
+	for _, s := range stackLadder {
+		rewritten = metadata.StampUnit(rewritten, metadata.GroupMicrobench, s.key, metadata.Provenance{GitCommit: "abc123def456", GitDirty: &clean})
+	}
+	if banner := bannerOf(Render(nil, nil, taxLadder(), rewritten)); !strings.Contains(banner, hostBanner) {
+		t.Errorf("a dedicated top level must not vouch for undeclared units:\n%s", banner)
+	}
+
+	legacy := canonicalMeta()
+	if banner := bannerOf(Render(nil, nil, taxLadder(), legacy)); !strings.Contains(banner, hostBanner) {
+		t.Errorf("a pre-groups snapshot with no host class must be labelled:\n%s", banner)
+	}
+	legacy.HostClass = metadata.HostClassDedicated
+	if banner := bannerOf(Render(nil, nil, taxLadder(), legacy)); strings.Contains(banner, hostBanner) {
+		t.Errorf("a pre-groups snapshot is judged by its declared top level:\n%s", banner)
 	}
 }
 

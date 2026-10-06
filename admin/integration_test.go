@@ -11,12 +11,12 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/gombit-dev/gombit/admin"
 	"github.com/gombit-dev/gombit/auth"
 	"github.com/gombit-dev/gombit/config"
 	"github.com/gombit-dev/gombit/database"
 	"github.com/gombit-dev/gombit/framework"
-	"github.com/gin-gonic/gin"
 )
 
 var (
@@ -36,6 +36,20 @@ func TestResourceMySQL(t *testing.T) {
 		t.Skip("set -admin.mysql-dsn to run MySQL admin integration tests")
 	}
 	runResourceDriver(t, config.DatabaseDriverMySQL, *mysqlDSN)
+}
+
+func TestStoredZeroAdminPostgres(t *testing.T) {
+	if *postgresDSN == "" {
+		t.Skip("set -admin.postgres-dsn to run Postgres admin integration tests")
+	}
+	runStoredZeroAdmin(t, openAdminDriver(t, config.DatabaseDriverPostgres, *postgresDSN))
+}
+
+func TestStoredZeroAdminMySQL(t *testing.T) {
+	if *mysqlDSN == "" {
+		t.Skip("set -admin.mysql-dsn to run MySQL admin integration tests")
+	}
+	runStoredZeroAdmin(t, openAdminDriver(t, config.DatabaseDriverMySQL, *mysqlDSN))
 }
 
 func runResourceDriver(t *testing.T, driver config.DatabaseDriver, dsn string) {

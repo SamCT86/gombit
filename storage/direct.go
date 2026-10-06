@@ -36,6 +36,15 @@ type DirectUploader interface {
 	UploadURL(ctx context.Context, key string, opts UploadURLOptions) (UploadRequest, error)
 }
 
+// SignedUploadTimeout is how long after a direct upload's grant expires its
+// upload may still be writing the object. A grant bounds only when the PUT
+// may start, so the app's own storage route (presign.Handler) aborts a PUT
+// still running this long after its URL expired: nothing it serves is
+// published later. S3 cannot be told to abort a presigned PUT it has
+// started, which is why direct uploads under storage/claims are staged:
+// the client only ever writes a staging key (upload.StagingKey).
+const SignedUploadTimeout = time.Hour
+
 // UploadVerifier is a DirectUploader whose backend can keep more about an
 // uploaded object than ObjectInfo describes, set by the client outside
 // what its grant signed: S3 stores a PUT's Cache-Control,

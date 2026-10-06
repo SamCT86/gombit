@@ -9,6 +9,7 @@ import (
 	"github.com/gombit-dev/gombit/config"
 	"github.com/gombit-dev/gombit/field"
 	"github.com/gombit-dev/gombit/resourcepolicy"
+	"github.com/gombit-dev/gombit/storage/filefield"
 	"gorm.io/gorm/schema"
 )
 
@@ -78,6 +79,21 @@ func registerModel(host Host, model any, opts Options) error {
 	if err := fillConstraints(opts.Fields, sch); err != nil {
 		return err
 	}
+	if err := fillFilePolicies(opts.Slug, opts.Fields, sch); err != nil {
+		return err
+	}
+	// A file field is written through the claims, over the host's store:
+	// without one, clearing a file or deleting a row would write past the
+	// claims and strand the files they hold. Refuse it here.
+	for _, f := range opts.Fields {
+		if f.Type != TypeFile && f.Type != TypeImage {
+			continue
+		}
+		if st, ok := host.(storer); !ok || st.Storage() == nil {
+			return fmt.Errorf("admin: field %q of %s is a file or image, and the host has no object storage to keep its files in", f.Name, opts.Slug)
+		}
+		break
+	}
 	if err := alignQuerySurface(&opts, sch, derived); err != nil {
 		return err
 	}
@@ -85,7 +101,8 @@ func registerModel(host Host, model any, opts Options) error {
 		opts.Search = defaultSearchFields(opts.Fields)
 	}
 
-	if opts.Actions.zero() {
+	defaultedActions := opts.Actions.zero()
+	if defaultedActions {
 		opts.Actions = defaultActions()
 	}
 	if opts.Singular == "" {
@@ -130,6 +147,13 @@ func registerModel(host Host, model any, opts Options) error {
 	if err != nil {
 		return err
 	}
+	// The admin performs no action on a storage-backed column it does not
+	// write through the upload protocol (storage/claims): those it does not
+	// map as a file field.
+	unownedFiles := unmappedFileColumns(sch, resolved)
+	if err := guardFileActions(opts.Slug, &opts.Actions, defaultedActions, unownedFiles); err != nil {
+		return err
+	}
 	if err := validateQueryableColumns(opts, resolved); err != nil {
 		return err
 	}
@@ -159,9 +183,13 @@ func registerModel(host Host, model any, opts Options) error {
 		m2m:            m2mBindings,
 		hasMany:        hasManyBindings,
 		serverRequired: serverRequired,
+		omitOnUpdate:   columnNames(unownedFiles),
 	}
 	for i := range m.fields {
 		m.fieldByName[m.fields[i].Name] = &m.fields[i]
+		if m.fields[i].policy != nil {
+			m.files = append(m.files, &m.fields[i])
+		}
 	}
 	m.version = detectVersionField(sch)
 	// The optimistic-lock update path (updateVersioned) and the many-to-many
@@ -539,17 +567,140 @@ func resolveFields(fields []Field, sch *schema.Schema) ([]resolvedField, []*m2mB
 		if sf == nil {
 			return nil, nil, nil, fmt.Errorf("admin: field %q does not exist on the model", f.Name)
 		}
-		column := f.Column
-		if column == "" {
-			column = sf.DBName
+		// A storage-backed column's key may only be written through the
+		// upload protocol (a confirmed upload, held in the record's
+		// transaction: storage/claims), which only the file and image
+		// types take part in (files.go). Mapped as any other type, an
+		// explicit field would write arbitrary keys past it, and strand the
+		// claim of the key it replaced.
+		if isFileColumn(sf) {
+			// Declared as the column's own kind: a file field's writes go
+			// through the upload protocol, and the kind sets the policy
+			// (an image column's image types). Another type would bypass
+			// the protocol; the other file kind would change the policy
+			// (TypeFile on an image column accepts any type). Narrowing
+			// belongs in the storage tag.
+			if want := inferFieldType(sf); f.Type != want {
+				return nil, nil, nil, fmt.Errorf("admin: field %q maps the storage-backed column %q, a %s, as %q; declare it as %q (its writes go through the upload protocol, under the column's own policy)", f.Name, sf.DBName, want, f.Type, want)
+			}
 		}
+		// The column is the matched schema field's, the one the accessors
+		// below read and write: never a caller string that could name
+		// another (see matchSchemaField).
 		out = append(out, resolvedField{
 			Field:   copyRel,
-			column:  column,
+			column:  sf.DBName,
 			pointer: sf.FieldType.Kind() == reflect.Pointer,
 			get:     makeGetter(sf.StructField.Index, f.Type),
 			set:     makeSetter(sf.StructField.Index, f.Type, sf.FieldType),
 		})
 	}
 	return out, bindings, hasMany, nil
+}
+
+// fillFilePolicies parses each file or image field's upload policy from the
+// model's storage tag (the prefix it owns, its largest file, the types it
+// accepts; see filefield.Policy). A field without a prefix owns
+// <table>/<column>/. Its Scope is "admin:<slug>.<field>": the admin's
+// grants are claimed for that field of that model, and only it can accept
+// them (storage/claims), whatever the prefixes.
+func fillFilePolicies(slug string, fields []Field, sch *schema.Schema) error {
+	for i := range fields {
+		f := &fields[i]
+		if f.Type != TypeFile && f.Type != TypeImage {
+			continue
+		}
+		sf := matchSchemaField(sch, *f)
+		if sf == nil {
+			return fmt.Errorf("admin: file field %q does not exist on the model", f.Name)
+		}
+		p, err := filefield.Policy(sf.Tag.Get("storage"), field.Kind(f.Type), sch.Table+"/"+sf.DBName+"/")
+		if err != nil {
+			return fmt.Errorf("admin: field %q: %w", f.Name, err)
+		}
+		p.Scope = "admin:" + slug + "." + f.Name
+		f.policy = &p
+		f.Accept = append([]string(nil), p.Types...)
+		f.MaxBytes = p.MaxBytes
+	}
+	return nil
+}
+
+// unmappedFileColumns are sch's storage-backed columns (file, image) that
+// no resolved admin field maps: the admin cannot write them through the
+// upload protocol.
+func unmappedFileColumns(sch *schema.Schema, resolved []resolvedField) []*schema.Field {
+	mapped := map[string]bool{}
+	for _, f := range resolved {
+		if f.column != "" {
+			mapped[f.column] = true
+		}
+	}
+	var out []*schema.Field
+	for _, sf := range sch.Fields {
+		if isFileColumn(sf) && !mapped[sf.DBName] {
+			out = append(out, sf)
+		}
+	}
+	return out
+}
+
+// guardFileActions fails closed on the actions the admin cannot honour for
+// unowned file columns (unmappedFileColumns):
+//   - delete: the row would go and its files stay held by a record that no
+//     longer exists, never reclaimed;
+//   - create, when one of them is required (a non-pointer, or NOT NULL):
+//     the row would be inserted with the empty key, no upload and no claim
+//     behind it, and every later create would collide with it in the
+//     column's unique index.
+//
+// Defaulted actions are turned off; an explicit one is a registration
+// error. (Update is safe: it leaves those columns out, see omitOnUpdate.)
+func guardFileActions(slug string, actions *Actions, defaulted bool, unowned []*schema.Field) error {
+	if len(unowned) == 0 {
+		return nil
+	}
+	required := ""
+	for _, sf := range unowned {
+		if sf.NotNull || sf.FieldType.Kind() != reflect.Pointer {
+			required = sf.DBName
+			break
+		}
+	}
+	if defaulted {
+		actions.Delete = false
+		if required != "" {
+			actions.Create = false
+		}
+		return nil
+	}
+	if actions.Delete {
+		return fmt.Errorf("admin: %s has storage-backed (file or image) columns the admin does not write through the upload protocol (%s), so it cannot delete its rows: their files would stay held by records that no longer exist; leave Actions.Delete off", slug, strings.Join(columnNames(unowned), ", "))
+	}
+	if actions.Create && required != "" {
+		return fmt.Errorf("admin: %s has the required storage-backed column %q, which the admin cannot set (it would store an empty key, no upload behind it); leave Actions.Create off", slug, required)
+	}
+	return nil
+}
+
+// columnNames are the DB names of fields.
+func columnNames(fields []*schema.Field) []string {
+	out := make([]string, len(fields))
+	for i, sf := range fields {
+		out[i] = sf.DBName
+	}
+	return out
+}
+
+// isFileColumn reports whether sf is a storage-backed column (a file or
+// image field).
+func isFileColumn(sf *schema.Field) bool {
+	if sf == nil || sf.DBName == "" {
+		return false
+	}
+	switch field.KindFromGo(sf.FieldType, string(sf.DataType)) {
+	case field.File, field.Image:
+		return true
+	}
+	return false
 }

@@ -1,14 +1,27 @@
 package admin_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gombit-dev/gombit/admin"
+	"github.com/gombit-dev/gombit/auth"
+	"github.com/gombit-dev/gombit/config"
+	"github.com/gombit-dev/gombit/database"
+	"github.com/gombit-dev/gombit/framework"
+	"github.com/gombit-dev/gombit/storage"
+	"github.com/gombit-dev/gombit/storage/claims"
+	"github.com/gombit-dev/gombit/types"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -384,5 +397,320 @@ func TestRegisterErrorIsNotWrappedAsHTTP(t *testing.T) {
 	var env interface{ GetStatus() int }
 	if errors.As(err, &env) {
 		t.Fatalf("Register should not return an HTTP error, got %#v", err)
+	}
+}
+
+type Attachment struct {
+	gorm.Model
+	Title string      `gorm:"not null"`
+	File  *types.File `gorm:"size:512;uniqueIndex"`
+}
+
+// TestRegisterWithAFileColumn: a model with a storage-backed column, with
+// no storage tag, registers (its field owns <table>/<column>/), delete
+// included: the admin deletes the row through the claims (claims.DeleteWith),
+// releasing its file in the same transaction and deleting it after.
+func TestRegisterWithAFileColumn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openSQLite(t)
+	if err := auth.Migrate(db.DB); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(append(claims.Models(), &Attachment{})...); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultFor(config.EnvironmentTest)
+	cfg.HTTP.Addr = "127.0.0.1:0"
+	cfg.Auth.JWTSecret = testJWTSecret
+	cfg.Auth.BcryptCost = bcrypt.MinCost
+	cfg.Auth.AccessTokenTTL = time.Minute
+	cfg.Auth.RefreshTokenTTL = time.Hour
+	cfg.Auth.Mode = config.AuthModeCookie
+	cfg.Storage.Driver = config.StorageDriverMemory
+	app, err := framework.New(framework.WithConfig(cfg), framework.WithDatabase(db), framework.WithLogger(zap.NewNop()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.Register(app, Attachment{}, admin.Options{Slug: "attachments"}); err != nil {
+		t.Fatalf("Register() = %v", err)
+	}
+	// A record holding a file, through the claims protocol.
+	ctx := context.Background()
+	cl := claims.New(db.DB, app.Storage())
+	key := "attachments/file/held"
+	if err := cl.Pending(ctx, key, "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Storage().Put(ctx, key, strings.NewReader("bytes"), storage.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	k := types.File(key)
+	rec := Attachment{Title: "a", File: &k}
+	if err := cl.CreateWith(ctx, []string{key}, func(tx *gorm.DB) error { return tx.Create(&rec).Error }); err != nil {
+		t.Fatal(err)
+	}
+
+	jar := loginSuperuser(t, app)
+	meta := doRequest(app, jar, http.MethodGet, apiPrefix(app)+"/admin/meta/attachments", "")
+	if meta.Code != http.StatusOK || !strings.Contains(meta.Body.String(), `"delete":true`) {
+		t.Fatalf("meta = %d %s; want delete enabled", meta.Code, meta.Body)
+	}
+	del := doRequest(app, jar, http.MethodDelete, fmt.Sprintf("%s/admin/resources/attachments/%d", apiPrefix(app), rec.ID), "")
+	if del.Code != http.StatusOK {
+		t.Fatalf("DELETE of a file-backed record = %d %s", del.Code, del.Body)
+	}
+	var n int64
+	db.Model(&Attachment{}).Where("id = ?", rec.ID).Count(&n)
+	var claim claims.Claim
+	err = db.Where("object_key = ?", key).Take(&claim).Error
+	if n != 0 || (err == nil && claim.State != claims.Deleting) {
+		t.Fatalf("after the delete: %d records, claim %+v (%v); want the record gone and its claim released", n, claim, err)
+	}
+	if ok, _ := storage.Exists(ctx, app.Storage(), key); ok {
+		t.Fatal("the deleted record's file was kept")
+	}
+
+	id := admin.Field{Name: "id", Type: admin.TypeInteger, ReadOnly: true}
+	// Explicit Fields cannot map the file column as any type but file or
+	// image (whose writes go through the upload protocol): that would write
+	// arbitrary keys past it, and strand the replaced key's claim.
+	for name, fields := range map[string][]admin.Field{
+		"by name":   {id, {Name: "title", Type: admin.TypeString}, {Name: "file", Type: admin.TypeString}},
+		"by column": {id, {Name: "title", Type: admin.TypeString}, {Name: "attachment_key", Type: admin.TypeString, Column: "file"}},
+		"read-only": {id, {Name: "title", Type: admin.TypeString}, {Name: "file", Type: admin.TypeString, ReadOnly: true}},
+	} {
+		err := admin.Register(app, Attachment{}, admin.Options{Slug: "attachments-" + strings.ReplaceAll(name, " ", "-"), Fields: fields})
+		if err == nil || !strings.Contains(err.Error(), "upload protocol") {
+			t.Errorf("Register() with the file column mapped %s = %v, want an error", name, err)
+		}
+	}
+	typed := []admin.Field{id, {Name: "title", Type: admin.TypeString}, {Name: "file", Type: admin.TypeFile}}
+	if err := admin.Register(app, Attachment{}, admin.Options{Slug: "attachments-typed", Fields: typed}); err != nil {
+		t.Fatalf("Register() with the file column as a file field = %v", err)
+	}
+	if err := admin.Register(app, Attachment{}, admin.Options{Slug: "attachments-titled", Fields: []admin.Field{id, {Name: "title", Type: admin.TypeString}}}); err != nil {
+		t.Fatalf("Register() with explicit Fields leaving the file out = %v", err)
+	}
+	// A fresh record holding a file: no admin write can attach a foreign key.
+	key2 := "attachments/file/held2"
+	if err := cl.Pending(ctx, key2, "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Storage().Put(ctx, key2, strings.NewReader("bytes"), storage.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	k2 := types.File(key2)
+	rec2 := Attachment{Title: "b", File: &k2}
+	if err := cl.CreateWith(ctx, []string{key2}, func(tx *gorm.DB) error { return tx.Create(&rec2).Error }); err != nil {
+		t.Fatal(err)
+	}
+	for _, slug := range []string{"attachments", "attachments-typed", "attachments-titled"} {
+		patch := doRequest(app, jar, http.MethodPatch, fmt.Sprintf("%s/admin/resources/%s/%d", apiPrefix(app), slug, rec2.ID), `{"title":"c","file":"some/foreign/key"}`)
+		var got Attachment
+		if err := db.First(&got, rec2.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if got.File == nil || string(*got.File) != key2 {
+			t.Fatalf("PATCH %s (%d %s) changed the file to %v", slug, patch.Code, patch.Body, got.File)
+		}
+	}
+	var claim2 claims.Claim
+	if err := db.Where("object_key = ?", key2).Take(&claim2).Error; err != nil || claim2.State != claims.Held {
+		t.Fatalf("after the PATCHes the claim = %+v, %v; want held", claim2, err)
+	}
+}
+
+// Contract has a required file (the shape `make resource` generates for
+// attachment:file:required), and Report a versioned optional image.
+type Contract struct {
+	gorm.Model
+	Title string     `gorm:"not null"`
+	Doc   types.File `gorm:"size:512;not null;uniqueIndex"`
+}
+
+type Report struct {
+	gorm.Model
+	Title   string       `gorm:"not null"`
+	Version int          `json:"version"`
+	Scan    *types.Image `gorm:"size:512;uniqueIndex"`
+}
+
+// newMemoryFileApp is a cookie-mode app on in-memory storage with the
+// claims table and models migrated.
+func newMemoryFileApp(t *testing.T, models ...any) (*framework.App, *database.DB) {
+	t.Helper()
+	db := openSQLite(t)
+	if err := auth.Migrate(db.DB); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(append(claims.Models(), models...)...); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultFor(config.EnvironmentTest)
+	cfg.HTTP.Addr = "127.0.0.1:0"
+	cfg.Auth.JWTSecret = testJWTSecret
+	cfg.Auth.BcryptCost = bcrypt.MinCost
+	cfg.Auth.AccessTokenTTL = time.Minute
+	cfg.Auth.RefreshTokenTTL = time.Hour
+	cfg.Auth.Mode = config.AuthModeCookie
+	cfg.Storage.Driver = config.StorageDriverMemory
+	app, err := framework.New(framework.WithConfig(cfg), framework.WithDatabase(db), framework.WithLogger(zap.NewNop()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return app, db
+}
+
+// TestAdminCannotCreateWithARequiredFile: a required file column the
+// admin maps (a file field) is created only with a confirmed upload; one it
+// does not map (explicit Fields leaving it out) cannot be set, so create is
+// off by default there, refused at request time, and an explicit
+// Actions.Create is a registration error. No path stores the empty key.
+func TestAdminCannotCreateWithARequiredFile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	app, db := newMemoryFileApp(t, &Contract{}, &Report{})
+	if err := admin.Register(app, Contract{}, admin.Options{Slug: "contracts"}); err != nil {
+		t.Fatal(err)
+	}
+	id := admin.Field{Name: "id", Type: admin.TypeInteger, ReadOnly: true}
+	titled := []admin.Field{id, {Name: "title", Type: admin.TypeString}}
+	if err := admin.Register(app, Contract{}, admin.Options{Slug: "contracts-titled", Fields: titled}); err != nil {
+		t.Fatal(err)
+	}
+	explicit := admin.Options{Slug: "contracts-all", Fields: titled, Actions: admin.Actions{List: true, Detail: true, Create: true, Update: true}}
+	if err := admin.Register(app, Contract{}, explicit); err == nil || !strings.Contains(err.Error(), "cannot set") {
+		t.Fatalf("Register() with Create and the required file unmapped = %v, want an error", err)
+	}
+	jar := loginSuperuser(t, app)
+	base := apiPrefix(app) + "/admin/resources/"
+	if rec := doRequest(app, jar, http.MethodPost, base+"contracts", `{"title":"x"}`); rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("admin create without the required file = %d %s, want 422", rec.Code, rec.Body)
+	}
+	meta := doRequest(app, jar, http.MethodGet, apiPrefix(app)+"/admin/meta/contracts-titled", "")
+	if !strings.Contains(meta.Body.String(), `"create":false`) || !strings.Contains(meta.Body.String(), `"delete":false`) {
+		t.Fatalf("meta = %s; want create and delete off with the file unmapped", meta.Body)
+	}
+	for range 2 {
+		if rec := doRequest(app, jar, http.MethodPost, base+"contracts-titled", `{"title":"x"}`); rec.Code != http.StatusForbidden {
+			t.Fatalf("admin create with the required file unmapped = %d %s, want 403", rec.Code, rec.Body)
+		}
+	}
+	var n int64
+	db.Model(&Contract{}).Count(&n)
+	if n != 0 {
+		t.Fatalf("%d contracts inserted; want none (no empty keys)", n)
+	}
+	// An optional file is different: create stores NULL, which is valid.
+	if err := admin.Register(app, Report{}, admin.Options{Slug: "reports"}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doRequest(app, jar, http.MethodPost, base+"reports", `{"title":"r"}`); rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
+		t.Fatalf("admin create with an optional file = %d %s", rec.Code, rec.Body)
+	}
+
+	// A Column naming another schema field than the Name: the field is
+	// the Column's, alone, so no Name/Column mix can make the file column
+	// look mapped while the accessors write another.
+	aliased := []admin.Field{id, {Name: "title", Type: admin.TypeString, Column: "doc"}}
+	if err := admin.Register(app, Contract{}, admin.Options{Slug: "contracts-aliased", Fields: aliased}); err == nil || !strings.Contains(err.Error(), "upload protocol") {
+		t.Fatalf("Register() with Name title, Column doc = %v, want the file column refused", err)
+	}
+	if err := admin.Register(app, Contract{}, admin.Options{Slug: "contracts-nowhere", Fields: []admin.Field{id, {Name: "title", Type: admin.TypeString, Column: "nope"}}}); err == nil {
+		t.Fatal("Register() with a Column that does not exist succeeded")
+	}
+	swapped := []admin.Field{id, {Name: "doc", Type: admin.TypeString, Column: "title"}}
+	if err := admin.Register(app, Contract{}, admin.Options{Slug: "contracts-swapped", Fields: swapped}); err != nil {
+		t.Fatalf("Register() with Name doc, Column title = %v", err)
+	}
+	meta = doRequest(app, jar, http.MethodGet, apiPrefix(app)+"/admin/meta/contracts-swapped", "")
+	if !strings.Contains(meta.Body.String(), `"create":false`) || !strings.Contains(meta.Body.String(), `"delete":false`) {
+		t.Fatalf("meta = %s; want create and delete off: the doc column is not mapped", meta.Body)
+	}
+	if rec := doRequest(app, jar, http.MethodPost, apiPrefix(app)+"/admin/resources/contracts-swapped", `{"doc":"x"}`); rec.Code != http.StatusForbidden {
+		t.Fatalf("admin create through the swapped mapping = %d %s, want 403", rec.Code, rec.Body)
+	}
+	if err := admin.Register(app, Contract{}, admin.Options{Slug: "contracts-swapped-all", Fields: swapped, Actions: admin.Actions{List: true, Create: true}}); err == nil {
+		t.Fatal("Register() with Create through the swapped mapping succeeded")
+	}
+	db.Model(&Contract{}).Count(&n)
+	if n != 0 {
+		t.Fatalf("%d contracts inserted; want none", n)
+	}
+}
+
+// TestAdminUpdateLeavesFileColumnsAlone: an admin update never puts back a
+// file key over a concurrent change. Here another writer replaces the file
+// between the admin's load and its write (simulated by a callback): the
+// admin's write is fenced on the keys it loaded, so it answers 409 and
+// writes nothing, and the replacement stands, on the plain and the
+// versioned paths.
+func TestAdminUpdateLeavesFileColumnsAlone(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	app, db := newMemoryFileApp(t, &Attachment{}, &Report{})
+	for _, reg := range []struct {
+		model any
+		slug  string
+	}{{Attachment{}, "attachments"}, {Report{}, "reports"}} {
+		if err := admin.Register(app, reg.model, admin.Options{Slug: reg.slug}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jar := loginSuperuser(t, app)
+	// replace runs once, right after the admin loads the row (a query on
+	// table), committing on its own: another writer's change landing
+	// between the admin's load and its write.
+	var replace func(tx *gorm.DB)
+	var table string
+	if err := db.DB.Callback().Query().After("gorm:query").Register("test:replace-file", func(tx *gorm.DB) {
+		if replace != nil && tx.Statement.Table == table {
+			r := replace
+			replace = nil
+			r(tx.Session(&gorm.Session{NewDB: true}))
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	old, newer := types.File("attachments/file/old"), types.File("attachments/file/new")
+	att := Attachment{Title: "a", File: &old}
+	if err := db.Create(&att).Error; err != nil {
+		t.Fatal(err)
+	}
+	table = "attachments"
+	replace = func(tx *gorm.DB) {
+		if err := tx.Exec("UPDATE attachments SET file = ? WHERE id = ?", string(newer), att.ID).Error; err != nil {
+			t.Error(err)
+		}
+	}
+	if rec := doRequest(app, jar, http.MethodPatch, fmt.Sprintf("%s/admin/resources/attachments/%d", apiPrefix(app), att.ID), `{"title":"b"}`); rec.Code != http.StatusConflict {
+		t.Fatalf("PATCH racing a file replacement = %d %s, want 409", rec.Code, rec.Body)
+	}
+	var got Attachment
+	if err := db.First(&got, att.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "a" || got.File == nil || *got.File != newer {
+		t.Fatalf("after the PATCH: %+v; want nothing written and the replaced file kept", got)
+	}
+
+	oldScan, newScan := types.Image("reports/scan/old"), types.Image("reports/scan/new")
+	rep := Report{Title: "r", Scan: &oldScan}
+	if err := db.Create(&rep).Error; err != nil {
+		t.Fatal(err)
+	}
+	table = "reports"
+	replace = func(tx *gorm.DB) {
+		if err := tx.Exec("UPDATE reports SET scan = ? WHERE id = ?", string(newScan), rep.ID).Error; err != nil {
+			t.Error(err)
+		}
+	}
+	if rec := doRequest(app, jar, http.MethodPatch, fmt.Sprintf("%s/admin/resources/reports/%d", apiPrefix(app), rep.ID), fmt.Sprintf(`{"title":"s","version":%d}`, rep.Version)); rec.Code != http.StatusConflict {
+		t.Fatalf("versioned PATCH racing a file replacement = %d %s, want 409", rec.Code, rec.Body)
+	}
+	var gotRep Report
+	if err := db.First(&gotRep, rep.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if gotRep.Title != "r" || gotRep.Scan == nil || *gotRep.Scan != newScan {
+		t.Fatalf("after the versioned PATCH: %+v; want nothing written and the replaced file kept", gotRep)
 	}
 }

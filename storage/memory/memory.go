@@ -12,6 +12,8 @@ import (
 	"encoding/hex"
 	"io"
 	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +61,12 @@ func New(opts ...Option) *Store {
 }
 
 var _ storage.Storage = (*Store)(nil)
+
+var _ storage.BoundedWriter = (*Store)(nil)
+
+// BoundedWrites implements storage.BoundedWriter: a Put publishes in the
+// process, after checking its context, within the call.
+func (*Store) BoundedWrites() {}
 
 // reader is an object's bytes, seekable (for Range requests).
 type reader struct{ *bytes.Reader }
@@ -192,4 +200,32 @@ func (s *Store) Keys() []string {
 func copyInfo(info storage.ObjectInfo) storage.ObjectInfo {
 	info.Metadata = maps.Clone(info.Metadata)
 	return info
+}
+
+var _ storage.Lister = (*Store)(nil)
+
+// List implements storage.Lister, in key order, over a snapshot taken
+// when it starts (fn may delete).
+func (s *Store) List(ctx context.Context, prefix string, fn func(storage.ObjectInfo) error) error {
+	if err := ctx.Err(); err != nil {
+		return storage.Wrap("list", prefix, err)
+	}
+	s.mu.RLock()
+	var infos []storage.ObjectInfo
+	for k, o := range s.objects {
+		if strings.HasPrefix(k, prefix) {
+			infos = append(infos, copyInfo(o.info))
+		}
+	}
+	s.mu.RUnlock()
+	slices.SortFunc(infos, func(a, b storage.ObjectInfo) int { return strings.Compare(a.Key, b.Key) })
+	for _, info := range infos {
+		if err := ctx.Err(); err != nil {
+			return storage.Wrap("list", prefix, err)
+		}
+		if err := fn(info); err != nil {
+			return err
+		}
+	}
+	return nil
 }

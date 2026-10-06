@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useForm, type FieldValues } from "react-hook-form";
 import { Link, Navigate, useNavigate, useParams } from "react-router";
 
@@ -12,6 +12,7 @@ import { FieldWidget } from "../components/FieldWidget";
 import { canCreate, canPopulateEditForm, canUpdate, canViewDetail } from "../capabilities";
 import { spaDetailPath, spaListPath } from "../api/paths";
 import { emptyFormValue, formValuesToBody, rowToFormValues, writableFields } from "../fields";
+import { uploadsToDrop } from "../files";
 import type { Row } from "../api/types";
 
 type Props = {
@@ -46,10 +47,16 @@ export function ResourceFormPage({ mode }: Props) {
     handleSubmit,
     reset,
     setError,
+    getValues,
+    setValue,
+    getFieldState,
     formState: { isSubmitting },
   } = useForm<FieldValues>({
     defaultValues: defaults,
   });
+  // The values the form loaded (the defaults, or the row being edited):
+  // what a fresh upload is told apart from (freshFileFields).
+  const loaded = useRef<FieldValues>(defaults);
 
   useEffect(() => {
     if (mode !== "edit" || !model || !canPopulateEditForm(model)) {
@@ -65,7 +72,9 @@ export function ResourceFormPage({ mode }: Props) {
         if (cancelled) {
           return;
         }
-        reset(rowToFormValues(envelope.data, model.fields));
+        const values = rowToFormValues(envelope.data, model.fields);
+        loaded.current = values;
+        reset(values);
         setRowLoaded(true);
       })
       .catch((err: unknown) => {
@@ -146,6 +155,16 @@ export function ResourceFormPage({ mode }: Props) {
       if (!applyContractErrors(setError, err) && !orphan) {
         setStatus(err instanceof Error ? err.message : "request failed");
       }
+      // Any failed save may have discarded the files uploaded for it (a
+      // conflict, a stale version, or a field error raised inside the
+      // write): drop them, and ask for the files again.
+      const errored = new Set(model.fields.map((field) => field.name).filter((name) => getFieldState(name).error));
+      for (const drop of uploadsToDrop(model.fields, getValues(), loaded.current, errored)) {
+        setValue(drop.name, drop.value);
+        if (drop.message) {
+          setError(drop.name, { type: "server", message: drop.message });
+        }
+      }
     }
   }
 
@@ -214,6 +233,7 @@ export function ResourceFormPage({ mode }: Props) {
               field={field}
               control={control}
               disabled={field.readonly}
+              slug={slug}
             />
           ))}
           <Button type="submit" variant="contained" disabled={isSubmitting}>

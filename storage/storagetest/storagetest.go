@@ -70,6 +70,8 @@ var checks = []check{
 	{"OpenFollowsContext", checkOpenFollowsContext},
 	{"URL", checkURL},
 	{"DirectUpload", checkDirectUpload},
+	{"List", checkList},
+	{"Publish", checkPublish},
 }
 
 func ctxFor(t testing.TB) context.Context {
@@ -1000,4 +1002,165 @@ func checkDirectUpload(t testing.TB, s storage.Storage) {
 		t.Fatalf("UploadURL expires at %s, want within %s", req.Expires, valid.Expires)
 	}
 	wantNotFound(t, s, "direct/never-stored") // asking for a grant stores nothing
+}
+
+// checkList: a store that lists its objects (storage.Lister) lists exactly
+// those under the prefix, each once with its key, size, and modification
+// time; stops at fn's error and returns it; lets fn delete what it is
+// given; and honors an ended context.
+func checkList(t testing.TB, s storage.Storage) {
+	l, ok := s.(storage.Lister)
+	if !ok {
+		return
+	}
+	for _, key := range []string{"list/a", "list/b/c", "list/b/d", "listing", "other/list/a"} {
+		put(t, s, key, []byte("bytes of "+key), storage.PutOptions{})
+	}
+	collect := func(prefix string) map[string]storage.ObjectInfo {
+		got := map[string]storage.ObjectInfo{}
+		if err := l.List(ctxFor(t), prefix, func(o storage.ObjectInfo) error {
+			if _, dup := got[o.Key]; dup {
+				t.Fatalf("List(%q) gave %q twice", prefix, o.Key)
+			}
+			got[o.Key] = o
+			return nil
+		}); err != nil {
+			t.Fatalf("List(%q) = %v", prefix, err)
+		}
+		return got
+	}
+	got := collect("list/")
+	if len(got) != 3 {
+		t.Fatalf("List(\"list/\") = %v, want exactly list/a, list/b/c, list/b/d", keysOf(got))
+	}
+	for _, key := range []string{"list/a", "list/b/c", "list/b/d"} {
+		o, ok := got[key]
+		if !ok || o.Size != int64(len("bytes of "+key)) || o.ModTime.IsZero() {
+			t.Fatalf("List(\"list/\") gave %q as %+v", key, o)
+		}
+		st, err := s.Stat(ctxFor(t), key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// To the second: an S3 listing has milliseconds, its HEAD not.
+		if o.ETag != st.ETag || !o.ModTime.Truncate(time.Second).Equal(st.ModTime.Truncate(time.Second)) {
+			t.Fatalf("List gave %q ETag %q at %s; Stat says %q at %s (callers decide on these)", key, o.ETag, o.ModTime, st.ETag, st.ModTime)
+		}
+	}
+	if all := collect(""); len(all) < 5 {
+		t.Fatalf("List(\"\") = %v, want every object", keysOf(all))
+	}
+	stop := errors.New("stop here")
+	calls := 0
+	if err := l.List(ctxFor(t), "list/", func(storage.ObjectInfo) error { calls++; return stop }); !errors.Is(err, stop) || calls != 1 {
+		t.Fatalf("List stopped by fn = %v after %d calls, want fn's error after 1", err, calls)
+	}
+	if err := l.List(ctxFor(t), "list/b/", func(o storage.ObjectInfo) error { return s.Delete(ctxFor(t), o.Key) }); err != nil {
+		t.Fatalf("List deleting as it goes = %v", err)
+	}
+	if left := collect("list/"); len(left) != 1 {
+		t.Fatalf("after deleting list/b/*, List = %v", keysOf(left))
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	wantErr(t, l.List(canceled, "list/", func(storage.ObjectInfo) error { return nil }), context.Canceled, "list", "list/")
+}
+
+func keysOf(m map[string]storage.ObjectInfo) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// checkPublish: storage.PreparePublish publishes nothing; storage.Publish
+// copies the bytes, content type and metadata and leaves the source, and
+// refuses an occupied destination (ErrExists, leaving it); a missing source
+// is ErrNotFound. For a storage.Publisher, a fenced copy can never be
+// published, and fencing is idempotent, before and after publishing.
+func checkPublish(t testing.TB, s storage.Storage) {
+	ctx := ctxFor(t)
+	md := map[string]string{"filename": "a.txt"}
+	put(t, s, "pub/src", []byte("copied bytes"), storage.PutOptions{ContentType: "text/plain", Metadata: md})
+	token, err := storage.PreparePublish(ctx, s, "pub/src", "pub/dst")
+	if err != nil {
+		t.Fatalf("PreparePublish = %v", err)
+	}
+	if ok, err := storage.Exists(ctx, s, "pub/dst"); err != nil || ok {
+		t.Fatalf("PreparePublish published already (exists = %v, %v)", ok, err)
+	}
+	info, err := storage.Publish(ctx, s, token)
+	if err != nil {
+		t.Fatalf("Publish = %v", err)
+	}
+	if info.Key != "pub/dst" || info.Size != int64(len("copied bytes")) {
+		t.Fatalf("Publish reported %+v", info)
+	}
+	data, got := read(t, s, "pub/dst")
+	if string(data) != "copied bytes" || got.ContentType != "text/plain" || got.Metadata["filename"] != "a.txt" {
+		t.Fatalf("the copy is %q (%s, %v); want the source's bytes, type and metadata", data, got.ContentType, got.Metadata)
+	}
+	if data, _ := read(t, s, "pub/src"); string(data) != "copied bytes" {
+		t.Fatalf("Publish changed its source to %q", data)
+	}
+	if err := storage.Fence(ctx, s, token); err != nil {
+		t.Fatalf("Fence after Publish = %v", err)
+	}
+	if data, _ := read(t, s, "pub/dst"); string(data) != "copied bytes" {
+		t.Fatal("Fence after Publish removed the copy")
+	}
+	if _, err := storage.PreparePublish(ctx, s, "pub/missing", "pub/dst2"); !errors.Is(err, storage.ErrNotFound) {
+		// A store that copies in the process finds the source missing when
+		// it publishes.
+		if err != nil {
+			t.Fatalf("PreparePublish of a missing source = %v", err)
+		}
+		tok, _ := storage.PreparePublish(ctx, s, "pub/missing", "pub/dst2")
+		if _, err := storage.Publish(ctx, s, tok); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("Publish of a missing source = %v, want storage: object not found", err)
+		}
+	}
+	put(t, s, "pub/empty", nil, storage.PutOptions{})
+	token, err = storage.PreparePublish(ctx, s, "pub/empty", "pub/empty-copy")
+	if err != nil {
+		t.Fatalf("PreparePublish of an empty object = %v", err)
+	}
+	if _, err := storage.Publish(ctx, s, token); err != nil {
+		t.Fatalf("Publish of an empty object = %v", err)
+	}
+	if data, info := read(t, s, "pub/empty-copy"); len(data) != 0 || info.Size != 0 {
+		t.Fatalf("the empty object's copy is %q (%d bytes)", data, info.Size)
+	}
+	put(t, s, "pub/taken", []byte("kept"), storage.PutOptions{})
+	token, err = storage.PreparePublish(ctx, s, "pub/src", "pub/taken")
+	if err != nil {
+		t.Fatalf("PreparePublish onto an object = %v", err)
+	}
+	if _, err := storage.Publish(ctx, s, token); !errors.Is(err, storage.ErrExists) {
+		t.Fatalf("Publish onto an object = %v, want storage: an object is already stored", err)
+	}
+	_ = storage.Fence(ctx, s, token)
+	if data, _ := read(t, s, "pub/taken"); string(data) != "kept" {
+		t.Fatalf("a refused Publish changed its destination to %q", data)
+	}
+	if _, ok := s.(storage.Publisher); !ok {
+		return
+	}
+	token, err = storage.PreparePublish(ctx, s, "pub/src", "pub/fenced")
+	if err != nil {
+		t.Fatalf("PreparePublish = %v", err)
+	}
+	if err := storage.Fence(ctx, s, token); err != nil {
+		t.Fatalf("Fence = %v", err)
+	}
+	if _, err := storage.Publish(ctx, s, token); err == nil {
+		t.Fatal("a fenced copy was published")
+	}
+	if ok, _ := storage.Exists(ctx, s, "pub/fenced"); ok {
+		t.Fatal("a fenced copy was published")
+	}
+	if err := storage.Fence(ctx, s, token); err != nil {
+		t.Fatalf("Fence again = %v; fencing must be idempotent", err)
+	}
 }

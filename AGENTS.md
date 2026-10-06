@@ -44,7 +44,7 @@ timeouts, permanent failures), delayed dispatch (`jobs.Delay`, `jobs.At`),
 failed jobs (`gombit jobs failed|inspect|retry|forget|purge`), duplicate
 handling (`jobs.Unique`, `jobs.UniqueFor`, `jobs.Once`), and observability
 (`gombit_jobs_*` metrics, OpenTelemetry spans). The **STORAGE-0** epic
-(#279) has started: `storage` holds the object storage contract
+(#279) is complete: `storage` holds the object storage contract
 (`storage.Storage`, portable keys, classified errors), `storage/storagetest`
 the driver conformance suite, and `storage/local` (hash-addressed files,
 atomic writes), `storage/memory`, and `storage/s3` (S3-compatible, streaming
@@ -53,7 +53,18 @@ local by default), `storage/upload` the upload helpers (size limits,
 content-detected type policy, generated keys), and public and signed URLs
 (visibility by key prefix; presigned on S3, `storage/presign` HMAC URLs
 served at `/_storage` for local and memory), and direct uploads
-(`storage.DirectUploader`, `upload.Authorize` / `upload.Confirm`). The other batteries
+(`storage.DirectUploader`, `upload.Authorize` / `upload.Confirm`), and
+cleanup semantics (`storage/claims`: a `storage_claims` table of
+pending/promoting/held/deleting keys moved by conditional updates, with
+leases and tombstones, so cleanup never deletes a file a record holds and
+no late upload leaves an orphan; direct uploads are staged under
+`_staging/` (a reserved namespace) and promoted by `upload.Confirm`
+with a fenceable `storage.PreparePublish`/`Publish`/`Fence`;
+`storage.Lister` enumerates objects), and
+storage-backed model fields (`file` / `image` kinds, `types.File` /
+`types.Image`, runtime `storage/filefield`; MODEL-8) with their admin
+widgets (upload grants, previews, cleanup after commit; STORAGE-8); see
+`docs/storage.md`. The other batteries
 (events, scheduler, mail, gRPC, multi-tenancy, i18n) are not here yet.
 The **CHAOS-0** resilience suite is in: `internal/faulttest` (deterministic
 fault injection: a faulting `database/sql` driver, a scripted HTTP
@@ -121,7 +132,7 @@ A change is not done unless:
 4. Any API change regenerates the OpenAPI doc + TS client in the same PR.
 5. No secrets in generated frontend source; `VITE_*` is treated as public.
 6. Scope stays inside the issue's milestone. If work starts pulling in an M6
-   "battery" (events, scheduler, mail, storage, gRPC, multi-tenancy, i18n),
+   "battery" (events, scheduler, mail, gRPC, multi-tenancy, i18n),
    stop and split it out into its own epic.
 7. The PR links its issue and states which acceptance criteria it satisfies.
 
