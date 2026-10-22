@@ -45,6 +45,13 @@ version.
 
 ### Fixed
 
+- Production configuration now refuses the JWT secret copied from the
+  repository's auth examples even though it is longer than the normal
+  minimum. `gombit doctor` reports it as a known development placeholder.
+  **Security-impacting upgrade:** replace this publicly known example secret
+  with a unique random key before deploying or upgrading; changing the key
+  invalidates previously signed tokens
+  ([#504](https://github.com/gombit-dev/gombit/issues/504)).
 - Saving the admin edit form no longer rewrites fields the operator did not
   touch: it sent every field back, so each save truncated a datetime to the
   minute (`12:30:45.123456` became `12:30:00`) and an integer past 2^53 to

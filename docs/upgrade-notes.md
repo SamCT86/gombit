@@ -12,6 +12,15 @@ compatibility manifest (see [upgrade.md](upgrade.md)).
 
 ### Manual: action required
 
+- **Breaking.** Production rejects the JWT secret published in the repository's examples; doctor flags it. (`reject-published-example-jwt-secret`, security, [#504](https://github.com/gombit-dev/gombit/issues/504))
+
+  - Configuration: `GOMBIT_JWT_SECRET`: some values are now refused in production.
+
+  Production applications that copied the example JWT secret now fail
+  configuration validation. Replace it with a unique cryptographically
+  random secret before upgrading. Changing the key invalidates tokens
+  signed with the old value.
+
 - **Breaking.** Email verification adds `users.email_verified_at` and `users.verified_email`, and a table, `auth_one_time_tokens`, which registration and `gombit createsuperuser` write: an app migrates before it runs this release. (`email-verification-schema`, schema, [#331](https://github.com/gombit-dev/gombit/issues/331))
 
   - Framework schema: `auth.User` (`users`): altered.

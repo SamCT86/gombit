@@ -509,6 +509,20 @@ releases:
 
   - version: unreleased
     changes:
+      - id: reject-published-example-jwt-secret
+        kind: manual
+        breaking: true
+        area: security
+        summary: "Production rejects the JWT secret published in the repository's examples; doctor flags it."
+        details: |
+          Production applications that copied the example JWT secret now fail
+          configuration validation. Replace it with a unique cryptographically
+          random secret before upgrading. Changing the key invalidates tokens
+          signed with the old value.
+        config:
+          - {var: GOMBIT_JWT_SECRET, change: refused, environment: production}
+        refs: [504]
+
       - id: go-1-26-9
         kind: informational
         area: dependency
