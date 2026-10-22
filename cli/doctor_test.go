@@ -27,6 +27,20 @@ func TestCheckInsecureFlagsInsecureCookieInProduction(t *testing.T) {
 	}
 }
 
+func TestCheckInsecureFlagsPublishedExampleJWTSecret(t *testing.T) {
+	cfg := config.DefaultFor(config.EnvironmentProduction)
+	cfg.Auth.JWTSecret = "dev-only-example-jwt-secret-not-for-prod"
+	cfg.Database.Driver = config.DatabaseDriverPostgres
+
+	check := checkInsecure(cfg)
+	if check.Status != doctorStatusFail {
+		t.Fatalf("checkInsecure status = %q, want %q", check.Status, doctorStatusFail)
+	}
+	if !strings.Contains(check.Message, "known development placeholder") {
+		t.Fatalf("checkInsecure message = %q, want development placeholder warning", check.Message)
+	}
+}
+
 func TestConfigLoadRejectsInsecureCookieInProductionBeforeDoctorChecks(t *testing.T) {
 	prev := LoadConfig
 	t.Cleanup(func() { LoadConfig = prev })
