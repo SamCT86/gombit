@@ -192,6 +192,9 @@ func registerModel(host Host, model any, opts Options) error {
 		}
 	}
 	m.version = detectVersionField(sch)
+	if m.version != nil {
+		m.meta.Version = m.version.name
+	}
 	// The optimistic-lock update path (updateVersioned) and the many-to-many
 	// join sync are separate write paths; combining them on one model would
 	// silently drop the m2m write on a versioned PATCH. Refuse the combination
@@ -200,7 +203,9 @@ func registerModel(host Host, model any, opts Options) error {
 		return fmt.Errorf("admin: model %q has both a version column and many_to_many field(s), which is not supported yet", opts.Slug)
 	}
 	if pk, ok := m.fieldByName[pkName]; ok && pk.Type != "" {
-		m.pkType = pk.Type
+		// A key declared as a relation (a shared-key one_to_one) is coerced
+		// as its column's type, like any relation value (issue #452).
+		m.pkType = pk.valueType()
 		if pk.column != "" {
 			m.pkColumn = pk.column
 		}
@@ -592,7 +597,9 @@ func resolveFields(fields []Field, sch *schema.Schema) ([]resolvedField, []*m2mB
 			column:  sf.DBName,
 			pointer: sf.FieldType.Kind() == reflect.Pointer,
 			get:     makeGetter(sf.StructField.Index, f.Type),
-			set:     makeSetter(sf.StructField.Index, f.Type, sf.FieldType),
+			set:     makeSetter(sf.StructField.Index, coerceTypeFor(f.Type, sf.FieldType), sf.FieldType),
+			// A belongs_to key is coerced as its column's type.
+			coerceType: coerceTypeFor(f.Type, sf.FieldType),
 		})
 	}
 	return out, bindings, hasMany, nil

@@ -63,8 +63,46 @@ with a fenceable `storage.PreparePublish`/`Publish`/`Fence`;
 `storage.Lister` enumerates objects), and
 storage-backed model fields (`file` / `image` kinds, `types.File` /
 `types.Image`, runtime `storage/filefield`; MODEL-8) with their admin
-widgets (upload grants, previews, cleanup after commit; STORAGE-8); see
-`docs/storage.md`. The other batteries
+widgets (upload grants, previews, cleanup after commit; STORAGE-8). The
+**UPGRADE-0** epic (#281) has started: `upgrade` detects an app's upgrade
+baseline (framework version from `go.mod`, scaffold version from the
+`gombit:` block `gombit new` writes to `gombit.yaml`, scaffold 0 for older
+apps), shown and recorded by `gombit upgrade baseline` (UPGRADE-1), and the
+compatibility manifest `upgrade/manifest.yaml` (every release's changes,
+classified manual/automatic/informational; `Manifest.Path` refuses unlisted
+versions), the source of `gombit upgrade notes`, `docs/upgrade-notes.md` and
+the release body (UPGRADE-2), and `gombit upgrade --dry-run`, which plans an
+upgrade to a target release from both and writes nothing
+(`upgrade.PlanUpgrade`; UPGRADE-3), and `gombit upgrade --to`, which applies
+its dependency changes with the go command (`go mod edit` for the
+framework's replaces, then `go get`), restoring go.mod and go.sum on any
+failure (`upgrade.ApplyDependencies`; UPGRADE-4), and `gombit upgrade check`,
+which reports uses of framework APIs whose doc has a `Deprecated:` paragraph,
+resolved from type information (`upgrade.ScanDeprecated`, `go/packages`;
+UPGRADE-5), and `gombit upgrade fix`, which runs codemods: rewrites of an
+app's uses of changed framework APIs, done on the syntax tree with type
+information, gofmt-formatted and type-checked again, printed as a patch
+unless `--write` (`upgrade.RunCodemods`, manifest action `codemod:<id>`;
+none ship yet; UPGRADE-6), and `gombit upgrade config`, which reports an
+upgrade's configuration changes for the app (renamed, default changed,
+action required, security review; never a value from its `.env` files)
+and upgrades its `.env` templates with `--write` (`upgrade.AnalyzeConfig`,
+manifest `config:` entries, the `config.Variables()` catalog held to the
+manifest by a snapshot test; UPGRADE-7), and `gombit upgrade contract`,
+which reports stale generated contract artifacts (resource `*.gen.go`,
+OpenAPI document, TypeScript client) by the existing drift gates' own
+checks, and regenerates them with `--write`, generator-owned files only
+(`upgrade/contractcheck`; UPGRADE-8), and framework-schema upgrade
+planning: the plan lists the framework-owned tables (auth, storage claims)
+a release adds, alters or removes, with the migration steps the app needs
+from its model registry, and no upgrade command ever runs a migration
+(`upgrade.AnalyzeSchema`, manifest `schema:` entries, the framework's
+tables held to the manifest by a snapshot test; UPGRADE-9), and the
+compatibility and deprecation policy (`docs/compatibility.md`, enforced from
+v0.8.0: breaking changes only in minors pre-1.0 and majors from 1.0, with a
+security exception, refused by the release gate; deprecations name their
+release, with a window `gombit upgrade check` shows; `upgrade/policy.go`;
+UPGRADE-10). The other batteries
 (events, scheduler, mail, gRPC, multi-tenancy, i18n) are not here yet.
 The **CHAOS-0** resilience suite is in: `internal/faulttest` (deterministic
 fault injection: a faulting `database/sql` driver, a scripted HTTP
@@ -72,6 +110,16 @@ dependency, a TCP fault proxy, the retry-policy check), `TestFault_*` tests
 run by `make test-faults` (a sharded PR check), and the seeded stochastic
 suite `internal/chaos` (`make test-chaos`, nightly `chaos.yml`, never a PR
 check). See `docs/testing/fault-injection.md`.
+The **AUTH-0** epic (#280) has started with AUTH-5 (#335): session
+management in both auth modes (`GET` / `DELETE {prefix}/auth/sessions`,
+`auth.Service.ListSessions` / `RevokeSession` / `RevokeAllSessions`), with
+token rotation and the session revocations serialized per user on a lock of
+the user's row, and AUTH-1 (#331): email verification (single-use,
+expiring, hashed tokens in `auth_one_time_tokens`; `POST
+{prefix}/auth/verify-email` and `/resend`; `auth.RequireVerifiedEmail`), with
+mail behind the `auth.Mailer` interface (`framework.WithAuthMailer`,
+`auth.LogMailer` in development, `authtest.Mailer` for tests); see
+`docs/auth.md`.
 Don't assume generated apps are committed in-tree; `gombit new` writes them
 on demand. Check `git log` / `ls` before describing "how the code works."
 

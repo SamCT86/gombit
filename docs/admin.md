@@ -97,10 +97,16 @@ beyond the first page) and the local filter is off; otherwise it filters the
 loaded page client-side. A model registered without a `Search` defaults it to
 its text columns (an explicit empty `Search` opts out), so pickers search out of
 the box.
-`datetime-local` values are converted to RFC3339 before POST/PATCH.
+`datetime-local` values are converted to RFC3339 before POST/PATCH. The edit
+form PATCHes only the fields the operator changed (compared with the values
+it loaded): an untouched field is not written back through the form, which
+shows a datetime to the minute and reads an integer past 2^53 rounded. An
+integer typed past 2^53 is sent as a string, which the server reads exactly.
 Empty optional (non-boolean) inputs — string, text, date, datetime, json,
-number, relation — are sent as JSON `null` so a partial PATCH can clear
-them. Booleans and numeric `0` are always included.
+number, relation — are sent as JSON `null` (on an edit, a field changed to
+empty), so a partial PATCH can clear them. On create, booleans and numeric `0` are always included; an edit sends
+the fields it changed, plus the model's optimistic-lock `version` (meta
+`version`) as loaded, so a concurrent edit is a 409.
 401 (including session expiry on list/detail/edit) returns to login;
 catalog 403 shows a forbidden page; other catalog errors show the D10
 message. Silent `POST /auth/refresh` after a 401 **awaits** CSRF bootstrap
@@ -229,6 +235,19 @@ Closed field types: `string`, `text`, `integer`, `float`, `decimal`,
 `boolean`, `datetime`, `date`, `time`, `duration`, `uuid`, `json`, `file`, `image`, `relation`. These strings are
 the admin projection of the shared vocabulary in [fields.md](fields.md).
 
+An integer value must fit the model field's Go type, and the int64 range
+(the column is a signed bigint on PostgreSQL and SQLite): 300 for an `int8`,
+-5 for a `uint`, or 2^63 for a `uint64` is a 422 on that field, never a
+wrapped value, whatever admin type the field is declared as. A JSON number is
+decoded as a float64, which keeps integers exactly only within ±(2^53 - 1),
+so a larger integer is sent as a string (`"9007199254740993"`), which is read
+exactly; as a JSON number it is a 422, unless it is the row's stored value
+rounded the same way, which is the bundled admin UI sending a field back
+unchanged (it sends integers as JSON numbers): the stored value is kept. The
+UI cannot set such an integer to another value; send it as a string through
+the API. The admin stores integers within int64, so a `uint64` above
+9223372036854775807 is a 422 too.
+
 ### File and image fields
 
 A `types.File` or `types.Image` column (see
@@ -318,7 +337,14 @@ create/update. `one_to_one` is the unique foreign key. Auto-derivation
 (`FieldsFrom`) renders the FK column as a relation field (target `slug` = the
 related table, label = the field name of its `name` column when present) so
 the SPA shows a picker instead of a
-bare integer, and the picker submits the selected primary key. **`has_many` is
+bare integer, and the picker submits the selected primary key. The value is
+coerced as the foreign-key column's Go type: a string key (a country code, a
+SKU) is the string sent, byte for byte (`"007"` stays `"007"`; a JSON number
+is refused, as for any string field), an integer key accepts a number or its
+digits as a string (`"7"`), and a uuid key a uuid in its canonical form, as a
+`uuid` field does. A primary key declared as a relation (a shared-key
+`one_to_one`) is read the same way in the path. Filters on the field read
+the value the same way. **`has_many` is
 read-only**: auto-derivation emits it, and when it maps to a real GORM has_many
 association the list/detail responses preload it and return the related
 children's primary keys (the SPA shows them as read-only chips); a `has_many`
@@ -399,7 +425,15 @@ List query parameters:
 Row JSON is keyed by registered field names, plus implicit `created_at` /
 `updated_at` when the GORM model has them and they were omitted from
 `Fields`. Create/update accept only writable (non-readonly) fields.
-`PATCH` is partial: omitted keys are left unchanged. A present JSON `null`
+`PATCH` is partial: omitted keys are left unchanged. The update writes only
+the columns whose value the request, a model hook or a GORM callback
+changed from the row as loaded (`database.ScopeEdit`), so another request's
+change to a column this one did not touch is kept, and the response is the
+row read back after the write (a delete landing in between makes it a 404). It never writes the row's associations: a `has_many` child moved
+or deleted meanwhile stays so, and `many_to_many` ids are synced only when the
+request sends them. A row deleted since it was loaded is a 404, not inserted
+again. (Two edits of the same column still race: the last one wins, except
+on a model with a `version` column.) A present JSON `null`
 (or `""` for string/text) clears an optional field — pointer dests become
 SQL NULL, non-pointer strings become `""`, `time.Time` becomes zero,
 `json.RawMessage` / `[]byte` become nil. Required fields with `null` still

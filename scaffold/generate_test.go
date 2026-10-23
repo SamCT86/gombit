@@ -14,6 +14,7 @@ import (
 
 	"github.com/gombit-dev/gombit/config"
 	"github.com/gombit-dev/gombit/migrations"
+	"github.com/gombit-dev/gombit/upgrade"
 )
 
 func TestGenerateWritesFeaturePackageLayout(t *testing.T) {
@@ -103,6 +104,15 @@ func TestGenerateWritesFeaturePackageLayout(t *testing.T) {
 		if !strings.Contains(yaml, want) {
 			t.Fatalf("gombit.yaml missing %q:\n%s", want, yaml)
 		}
+	}
+	// The upgrade baseline: recorded, at the current scaffold conventions,
+	// with go.mod's framework version.
+	baseline, err := upgrade.Detect(dest)
+	if err != nil {
+		t.Fatalf("upgrade.Detect on a new app: %v", err)
+	}
+	if !baseline.Recorded || baseline.Scaffold != upgrade.ScaffoldVersion || baseline.Metadata != upgrade.MetadataVersion || baseline.Framework.Version == "" {
+		t.Fatalf("a new app's baseline = %+v; want recorded at scaffold %d", baseline, upgrade.ScaffoldVersion)
 	}
 
 	envExample := readFile(t, filepath.Join(dest, ".env.example"))
@@ -303,8 +313,10 @@ func TestGenerateWritesFeaturePackageLayout(t *testing.T) {
 	if !strings.Contains(schema, `"/api/v1/products"`) {
 		t.Fatal("placeholder schema.ts missing product path")
 	}
-	if !strings.Contains(schema, `"/api/v1/auth/login"`) || !strings.Contains(schema, `"/api/v1/me"`) {
-		t.Fatal("placeholder schema.ts missing auth paths")
+	for _, path := range []string{`"/api/v1/auth/login"`, `"/api/v1/auth/sessions"`, `"/api/v1/auth/sessions/{id}"`, `"/api/v1/auth/verify-email"`, `"/api/v1/auth/verify-email/resend"`, `"/api/v1/me"`} {
+		if !strings.Contains(schema, path) {
+			t.Fatalf("placeholder schema.ts missing auth path %s", path)
+		}
 	}
 	if !strings.Contains(schema, "per_page?: number") {
 		t.Fatal("placeholder schema.ts missing list-products per_page query param")
@@ -436,6 +448,32 @@ func TestGenerateFlagValidation(t *testing.T) {
 				t.Fatalf("Generate() error = %q, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestGenerateDevNullIsNonInteractive(t *testing.T) {
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	defer func() { _ = devNull.Close() }()
+
+	stdout := new(bytes.Buffer)
+	err = Generate(context.Background(), Options{
+		Database: "sqlite",
+		WorkDir:  t.TempDir(),
+		Stdin:    devNull,
+		Stdout:   stdout,
+	})
+	if err == nil {
+		t.Fatal("Generate() error = nil, want non-interactive project-name error")
+	}
+	want := "project name is required (pass a name or run interactively on a TTY)"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Generate() error = %q, want %q", err, want)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want no interactive prompt", stdout.String())
 	}
 }
 

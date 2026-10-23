@@ -35,7 +35,7 @@ func AddCommand(root *Command, cmds ...*Command) {
 
 // NewRoot returns the framework Cobra tree (new, dev, worker, jobs, build,
 // make, generate, db, openapi, contract, client, routes, doctor, config,
-// createsuperuser, version). Generated apps call NewRoot, then
+// createsuperuser, version, upgrade). Generated apps call NewRoot, then
 // feature-package RegisterCommands, then ExecuteRoot.
 func NewRoot(stdout io.Writer, stderr io.Writer) *Command {
 	if stdout == nil {
@@ -80,6 +80,7 @@ func NewRoot(stdout io.Writer, stderr io.Writer) *Command {
 	root.AddCommand(newConfigCommand(stdout, stderr))
 	root.AddCommand(newCreateSuperuserCommand(stdout))
 	root.AddCommand(newVersionCommand(stdout))
+	root.AddCommand(newUpgradeCommand(stdout, stderr))
 	return root
 }
 
@@ -124,6 +125,7 @@ func rootLongHelp() string {
 		"  config    Show typed configuration (config show)",
 		"  createsuperuser  Create a superuser (admin) account",
 		"  version   Print the gombit version and build metadata",
+		"  upgrade   Upgrade the framework (upgrade --to), plan it (--dry-run); upgrade baseline, check, config, contract, fix, notes",
 	}, "\n")
 }
 
@@ -148,6 +150,14 @@ func usage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "  config show")
 	_, _ = fmt.Fprintln(w, "  createsuperuser [--email you@example.com] [--password ...] [--no-input]")
 	_, _ = fmt.Fprintln(w, "  version [--short]")
+	_, _ = fmt.Fprintln(w, "  upgrade --to vX.Y.Z [--dir .] [--json]")
+	_, _ = fmt.Fprintln(w, "  upgrade --dry-run [--to vX.Y.Z] [--dir .] [--json]")
+	_, _ = fmt.Fprintln(w, "  upgrade baseline [--dir .] [--json] [--write]")
+	_, _ = fmt.Fprintln(w, "  upgrade check [--dir .] [--json]")
+	_, _ = fmt.Fprintln(w, "  upgrade config [--dir .] [--from v] [--to v] [--write] [--json]")
+	_, _ = fmt.Fprintln(w, "  upgrade contract [--dir .] [--url URL] [--write] [--json]")
+	_, _ = fmt.Fprintln(w, "  upgrade fix [--dir .] [--only id,...] [--write | --patch FILE] [--json]")
+	_, _ = fmt.Fprintln(w, "  upgrade notes [--release v | --from v [--to v]] [--json]")
 }
 
 func dbUsage(w io.Writer) {

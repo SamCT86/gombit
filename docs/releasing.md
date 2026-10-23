@@ -16,12 +16,67 @@ automatically on merge.
    ```
 
 3. **Update [`CHANGELOG.md`](../CHANGELOG.md).** Move `[Unreleased]` entries
-   under a new version heading with today's date, and refresh the link
-   definitions at the bottom.
+   under a new version heading, and refresh the link definitions at the
+   bottom. The date is the day the release is tagged: if the release PR
+   waits, update it in the commit that is merged and tagged. An entry goes
+   under the release that shipped its change, which is the one the manifest
+   declares it in, even when the entry was written later
+   (`TestChangelogReleasesMatchManifest` checks every section, `[Unreleased]`
+   included, against the manifest release it covers). Empty `changelogExempt` in
+   [`upgrade/manifest_test.go`](../upgrade/manifest_test.go): its
+   exemptions covered the entries just moved, and one that matches nothing
+   in `[Unreleased]` fails the gate.
 4. **Sanity-check the docs** that name a version — mainly
    [`installation.md`](installation.md).
-5. **Decide the number.** Pre-1.0, breaking changes bump the minor
-   (`0.1.0` → `0.2.0`); fixes bump the patch.
+5. **Decide the number** by the
+   [compatibility policy](compatibility.md):
+   - Pre-1.0, a breaking change bumps the minor (`0.1.0` → `0.2.0`), and a
+     release with only fixes bumps the patch.
+   - The security exception lets a breaking `security` change ship in a
+     patch.
+   - The release gate (step 6) refuses a smaller bump than the manifest's
+     changes need, and names the release it needs. Dispatch the Release
+     workflow with that bump.
+   - v1.0.0 follows a minor line that deprecates nothing, so every pre-1.0
+     deprecation gets its window
+     ([across 1.0](compatibility.md#deprecations)).
+6. **Name the release in the compatibility manifest**
+   ([`upgrade/manifest.yaml`](../upgrade/manifest.yaml)). Rename its
+   `unreleased` entry to the version, or, only when there is no `unreleased`
+   entry (no upgrade-relevant change), add a `- version: vX.Y.Z` entry with
+   no changes: every release is listed, or upgrades from it have no known
+   path. Check that the upgrade-relevant changes since the last release are
+   there, classified: audit `git log vPREVIOUS..HEAD`, not only the CHANGELOG
+   (see
+   [upgrade.md](upgrade.md#the-compatibility-manifest)), then regenerate
+   [`upgrade-notes.md`](upgrade-notes.md) and preview the release body:
+
+   Add the version to `published` in
+   [`upgrade/plan_test.go`](../upgrade/plan_test.go), which checks that the
+   manifest lists, and plans from, every release already tagged.
+
+   ```bash
+   go test ./upgrade -run TestUpgradeNotesDoc -update
+   go run ./cmd/gombit upgrade notes --release v0.1.0 --release-gate
+   ```
+
+   Then move the configuration and framework-schema snapshots
+   ([`upgrade/testdata/config-variables.json`](../upgrade/testdata/config-variables.json),
+   [`upgrade/testdata/framework-schema.json`](../upgrade/testdata/framework-schema.json))
+   to the release, so the next cycle's changes are checked from it:
+
+   ```bash
+   go test ./upgrade -run 'TestConfigVariablesAreDeclared|TestFrameworkSchemaIsDeclared' -update
+   ```
+
+   The release workflow puts these notes at the top of the GitHub release,
+   and fails, before publishing, a stable release the manifest is not
+   closed at: the version must be listed, be the newest release it lists,
+   and leave no change under `unreleased` (`--release-gate`, as above). From
+   the Actions tab that happens before the tag is created. **A pushed tag is
+   already public** when the check runs, and since a tag is never moved, a
+   missing entry then costs a new patch version. Run the preview above
+   before pushing one.
 
 ## Cut the release
 

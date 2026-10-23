@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	"golang.org/x/mod/module"
+	"golang.org/x/term"
 )
 
 const (
@@ -26,7 +27,7 @@ const (
 	// DefaultModulePrefix is the module path used when --module is omitted.
 	DefaultModulePrefix = "github.com/example"
 
-	generatedGoVersion = "1.26.0"
+	generatedGoVersion = "1.26.9"
 )
 
 var (
@@ -58,11 +59,11 @@ type Options struct {
 	// skipAtlas bypasses the initial bootstrap migration in tests that stub
 	// go.sum population without a real go.mod/go.sum, mirroring resourcegen's
 	// own skipAtlas seam.
-	skipAtlas        bool
-	Stdin            io.Reader
-	Stdout           io.Writer
-	Stderr           io.Writer
-	IsTTY            func() bool
+	skipAtlas bool
+	Stdin     io.Reader
+	Stdout    io.Writer
+	Stderr    io.Writer
+	IsTTY     func() bool
 }
 
 func (opts *Options) normalize() error {
@@ -202,9 +203,5 @@ func stdinIsTTY(r io.Reader) bool {
 	if !ok {
 		return false
 	}
-	info, err := file.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(file.Fd()))
 }

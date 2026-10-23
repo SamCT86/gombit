@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
+	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gombit-dev/gombit/contract"
@@ -103,6 +106,14 @@ func (s *Service) me(ctx context.Context, _ *struct{}) (*meOutput, error) {
 	return &meOutput{Body: contract.Data[PublicUser]{Data: toPublicUser(user)}}, nil
 }
 
+// RequireBearer is the exported Bearer gate for an application's own
+// operations: it authenticates the Authorization header's access JWT and
+// stores the User on the request context for UserFromContext (and
+// RequireVerifiedEmail).
+func (s *Service) RequireBearer() func(ctx huma.Context, next func(huma.Context)) {
+	return s.requireBearer()
+}
+
 func (s *Service) requireBearer() func(ctx huma.Context, next func(huma.Context)) {
 	return func(ctx huma.Context, next func(huma.Context)) {
 		header := ctx.Header("Authorization")
@@ -111,13 +122,19 @@ func (s *Service) requireBearer() func(ctx huma.Context, next func(huma.Context)
 			writeAuthError(ctx, contract.WithContext(ctx.Context(), contract.Authentication("missing bearer token")))
 			return
 		}
-		user, err := s.ParseAccess(ctx.Context(), raw)
+		user, refreshID, err := s.parseAccess(ctx.Context(), raw)
 		if err != nil {
 			writeAuthError(ctx, contract.WithContext(ctx.Context(), contract.Authentication("invalid access token")))
 			return
 		}
-		next(huma.WithValue(ctx, userContextKey{}, user))
+		next(withSession(ctx, user, refreshID))
 	}
+}
+
+// withSession stores the authenticated user and the refresh token row id of
+// the request's session.
+func withSession(ctx huma.Context, user User, refreshID uint) huma.Context {
+	return huma.WithValue(huma.WithValue(ctx, userContextKey{}, user), sessionContextKey{}, refreshID)
 }
 
 func bearerToken(header string) (string, bool) {
@@ -134,6 +151,19 @@ func bearerToken(header string) (string, bool) {
 
 func writeAuthError(ctx huma.Context, env *contract.ErrorEnvelope) {
 	writeAuthChallenge(ctx, env, `Bearer realm="api"`)
+}
+
+// withBearerChallenge makes a handler-produced 401 conform to the Bearer
+// challenge used by the authentication gate. Keep this at the Bearer route
+// boundary: cookie-mode routes intentionally do not advertise HTTP Bearer.
+func withBearerChallenge(err error) error {
+	var statusErr huma.StatusError
+	if errors.As(err, &statusErr) && statusErr.GetStatus() == http.StatusUnauthorized {
+		headers := make(http.Header)
+		headers.Set("WWW-Authenticate", `Bearer realm="api"`)
+		return huma.ErrorWithHeaders(err, headers)
+	}
+	return err
 }
 
 // writeCookieAuthError is the cookie-mode counterpart: RFC 7235 says a 401
@@ -156,6 +186,7 @@ func writeAuthChallenge(ctx huma.Context, env *contract.ErrorEnvelope, challenge
 }
 
 func mapServiceError(ctx context.Context, err error) error {
+	var tooSoon resendTooSoonError
 	switch {
 	case errors.Is(err, errInvalidCredentials):
 		return contract.WithContext(ctx, contract.Authentication("invalid email or password"))
@@ -169,8 +200,26 @@ func mapServiceError(ctx context.Context, err error) error {
 		return contract.WithContext(ctx, contract.Validation("The request contains invalid fields.", map[string][]string{
 			"password": {err.Error()},
 		}))
+	case errors.Is(err, errSessionEnded):
+		return contract.WithContext(ctx, contract.Authentication("session has ended"))
+	case errors.Is(err, errSessionNotFound):
+		return contract.WithContext(ctx, contract.NotFound("session not found"))
 	case errors.Is(err, errUserNotFound):
 		return contract.WithContext(ctx, contract.Authentication("invalid access token"))
+	case errors.Is(err, errInvalidOneTimeToken):
+		return contract.WithContext(ctx, contract.Validation("The request contains invalid fields.", map[string][]string{
+			"token": {"invalid or expired token"},
+		}))
+	case errors.Is(err, errAlreadyVerified):
+		return contract.WithContext(ctx, contract.Conflict("email address is already verified"))
+	case errors.As(err, &tooSoon):
+		secs := int(math.Ceil(tooSoon.retryAfter.Seconds()))
+		return huma.ErrorWithHeaders(contract.WithContext(ctx, contract.RateLimited("a verification message was sent less than a minute ago")),
+			http.Header{"Retry-After": []string{strconv.Itoa(max(secs, 1))}})
+	case errors.Is(err, ErrNoMailer):
+		return contract.WithContext(ctx, contract.DependencyUnavailable("email delivery is not configured"))
+	case errors.Is(err, errMailNotSent):
+		return contract.WithContext(ctx, contract.DependencyUnavailable("the message could not be sent; try again"))
 	default:
 		return contract.WithContext(ctx, contract.Internal("auth request failed"))
 	}
@@ -186,4 +235,14 @@ func UserFromContext(ctx context.Context) (User, bool) {
 	}
 	user, ok := ctx.Value(userContextKey{}).(User)
 	return user, ok
+}
+
+type sessionContextKey struct{}
+
+// sessionFromContext returns the refresh token row id of the request's
+// session, stored alongside the user by requireBearer or
+// RequireCookieSession.
+func sessionFromContext(ctx context.Context) (uint, bool) {
+	id, ok := ctx.Value(sessionContextKey{}).(uint)
+	return id, ok && id != 0
 }

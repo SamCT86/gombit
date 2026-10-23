@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/gombit-dev/gombit/database"
 	"github.com/gombit-dev/gombit/field"
 	"github.com/gombit-dev/gombit/types"
 )
@@ -206,8 +208,9 @@ func coerceValue(raw any, ft FieldType) (any, error) {
 		}
 		return asString(raw)
 	case TypeRelation:
-		// belongs_to stores the FK as integer or string, whichever the
-		// payload used. The setter converts to the Go field type.
+		// A relation over a string, integer or uuid key is coerced as that
+		// type (coerceTypeFor); this is the fallback for any other key type
+		// (a struct such as uuid.NullUUID): an integer or the string sent.
 		if s, err := asString(raw); err == nil {
 			if n, nerr := strconv.ParseInt(s, 10, 64); nerr == nil {
 				return n, nil
@@ -225,7 +228,24 @@ func coerceFilter(raw string, ft FieldType) (any, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	return coerceValue(raw, ft)
+	return coerceText(raw, ft)
+}
+
+// coerceText coerces a value the database compares rather than stores (a
+// filter, a path id, a many-to-many id): a NUL byte or invalid UTF-8 is no
+// text any driver compares the same way (PostgreSQL refused it with a 500;
+// issue #444). A written value is judged by writtenTextProblem.
+func coerceText(raw any, ft FieldType) (any, error) {
+	v, err := coerceValue(raw, ft)
+	if err != nil {
+		return nil, err
+	}
+	if s, ok := v.(string); ok {
+		if msg := database.TextProblem(s); msg != "" {
+			return nil, errors.New(msg)
+		}
+	}
+	return v, nil
 }
 
 func coercePathID(id string, ft FieldType) (any, error) {
@@ -236,7 +256,7 @@ func coercePathID(id string, ft FieldType) (any, error) {
 	if ft == "" {
 		ft = TypeString
 	}
-	return coerceValue(id, ft)
+	return coerceText(id, ft)
 }
 
 func asString(raw any) (string, error) {
@@ -316,15 +336,9 @@ func asInt64(raw any) (int64, error) {
 		}
 		return int64(v), nil
 	case float32:
-		if float32(int64(v)) != v {
-			return 0, fmt.Errorf("must be an integer")
-		}
-		return int64(v), nil
+		return floatToInt64(float64(v))
 	case float64:
-		if v != math.Trunc(v) {
-			return 0, fmt.Errorf("must be an integer")
-		}
-		return int64(v), nil
+		return floatToInt64(v)
 	case json.Number:
 		n, err := v.Int64()
 		if err != nil {
@@ -333,6 +347,14 @@ func asInt64(raw any) (int64, error) {
 		return n, nil
 	case string:
 		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if errors.Is(err, strconv.ErrRange) {
+			// The admin stores integers within int64 (a signed bigint on
+			// PostgreSQL and SQLite), whatever the field's own type.
+			if strings.HasPrefix(strings.TrimSpace(v), "-") {
+				return 0, fmt.Errorf("must be at least %d", int64(math.MinInt64))
+			}
+			return 0, fmt.Errorf("must be at most %d", int64(math.MaxInt64))
+		}
 		if err != nil {
 			return 0, fmt.Errorf("must be an integer")
 		}
@@ -340,6 +362,26 @@ func asInt64(raw any) (int64, error) {
 	default:
 		return 0, fmt.Errorf("must be an integer")
 	}
+}
+
+// maxExactJSONInt is the largest integer a JSON number decoded as float64 is
+// sure to have kept (2^53-1, JavaScript's MAX_SAFE_INTEGER): from 2^53 on, a
+// decoded value may be a rounded neighbor (9007199254740993 arrives as
+// 9007199254740992).
+const maxExactJSONInt = 1<<53 - 1
+
+// floatToInt64 reads an integer sent as a JSON number (decoded as float64).
+// One outside int64 would wrap (1e30 became MinInt64), and one from 2^53 on
+// may already have lost digits, so both are refused: a large integer is sent
+// as a string, which is read exactly (issue #448).
+func floatToInt64(v float64) (int64, error) {
+	if v != math.Trunc(v) || math.IsInf(v, 0) || math.IsNaN(v) {
+		return 0, fmt.Errorf("must be an integer")
+	}
+	if v > maxExactJSONInt || v < -maxExactJSONInt {
+		return 0, fmt.Errorf("must be sent as a string: a JSON number beyond ±(2^53 - 1) may have lost digits")
+	}
+	return int64(v), nil
 }
 
 func asFloat64(raw any) (float64, error) {

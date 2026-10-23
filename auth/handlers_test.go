@@ -132,6 +132,8 @@ func TestOpenAPIIncludesAuthRoutes(t *testing.T) {
 		"/api/v1/auth/refresh",
 		"/api/v1/auth/logout",
 		"/api/v1/auth/register",
+		"/api/v1/auth/sessions",
+		"/api/v1/auth/sessions/{id}",
 		"/api/v1/me",
 		"bearerAuth",
 	} {
@@ -172,6 +174,19 @@ func runBearerE2E(t *testing.T, app *framework.App) {
 	}
 	oldRefresh := postJSON(t, app, "/api/v1/auth/refresh", `{"refresh_token":"`+pair.RefreshToken+`"}`)
 	assertError(t, oldRefresh, http.StatusUnauthorized, "authentication")
+
+	// Bearer mode has no session cookies, so a rejected refresh clears none.
+	for name, refresh := range map[string]string{
+		"rotated":    pair.RefreshToken,
+		"logged-out": rotated.RefreshToken,
+		"unknown":    strings.Repeat("ab", 32),
+	} {
+		rec := postJSON(t, app, "/api/v1/auth/refresh", `{"refresh_token":"`+refresh+`"}`)
+		assertError(t, rec, http.StatusUnauthorized, "authentication")
+		if got := rec.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("a Bearer refresh with the %s token set cookies %q, want none", name, got)
+		}
+	}
 }
 
 func newAuthApp(t *testing.T) *framework.App {
@@ -190,6 +205,31 @@ func newAuthAppWithDB(t *testing.T, db *database.DB) *framework.App {
 	cfg.Auth.BcryptCost = bcrypt.MinCost
 	cfg.Auth.AccessTokenTTL = time.Minute
 	cfg.Auth.RefreshTokenTTL = time.Hour
+	app, err := framework.New(
+		framework.WithConfig(cfg),
+		framework.WithDatabase(db),
+		framework.WithLogger(zap.NewNop()),
+	)
+	if err != nil {
+		t.Fatalf("framework.New() error = %v", err)
+	}
+	return app
+}
+
+// newAuthAppWithTTLs is newAuthAppWithDB in the given auth mode, with the
+// given token TTLs.
+func newAuthAppWithTTLs(t *testing.T, db *database.DB, mode config.AuthMode, access, refresh time.Duration) *framework.App {
+	t.Helper()
+	if err := auth.Migrate(db.DB); err != nil {
+		t.Fatalf("auth.Migrate() error = %v", err)
+	}
+	cfg := config.DefaultFor(config.EnvironmentTest)
+	cfg.HTTP.Addr = "127.0.0.1:0"
+	cfg.Auth.JWTSecret = testJWTSecret
+	cfg.Auth.BcryptCost = bcrypt.MinCost
+	cfg.Auth.AccessTokenTTL = access
+	cfg.Auth.RefreshTokenTTL = refresh
+	cfg.Auth.Mode = mode
 	app, err := framework.New(
 		framework.WithConfig(cfg),
 		framework.WithDatabase(db),
