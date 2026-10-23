@@ -45,6 +45,10 @@ version.
 
 ### Fixed
 
+- Bearer-mode session revocation errors now include the
+  `WWW-Authenticate: Bearer realm="api"` challenge when the authenticated
+  session ends between the request gate and the handler. Cookie-mode 401
+  responses remain unchanged ([#604](https://github.com/gombit-dev/gombit/issues/604)).
 - The OpenAPI contract for `POST /auth/verify-email/resend` now declares its
   429 response and integer `Retry-After` header, matching the response already
   sent at runtime ([#611](https://github.com/gombit-dev/gombit/issues/611)).
