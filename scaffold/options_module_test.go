@@ -57,6 +57,9 @@ func TestValidateModuleErrorDoesNotDuplicatePath(t *testing.T) {
 	if got := strings.Count(err.Error(), modulePath); got != 1 {
 		t.Fatalf("validateModule() error contains module path %d times, want 1: %v", got, err)
 	}
+	if !strings.Contains(err.Error(), "scaffold: invalid module path") {
+		t.Fatalf("validateModule() error = %v, want user-facing module path label", err)
+	}
 }
 
 func TestGenerateRejectsMalformedModuleBeforeWritingDestination(t *testing.T) {
@@ -90,6 +93,7 @@ func TestGenerateAcceptsSimpleMainModulePath(t *testing.T) {
 		t.Fatalf("Generate() error = %v", err)
 	}
 
+	// #nosec G304 -- test-controlled path under t.TempDir()
 	goMod, err := os.ReadFile(filepath.Join(workDir, "demo", "go.mod"))
 	if err != nil {
 		t.Fatalf("read generated go.mod: %v", err)
