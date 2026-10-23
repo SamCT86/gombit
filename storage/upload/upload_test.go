@@ -921,3 +921,222 @@ func TestDetectorCannotChangeTheFile(t *testing.T) {
 		t.Fatalf("the stored file differs from the upload: the detector changed it (first bytes %q)", got[:16])
 	}
 }
+
+// fakeClaims is a Claimer over store, as storage/claims behaves: Abandon
+// deletes a key's object (and a staged key's staging object) only while
+// the key is pending or promoting; any other key counts as held.
+type fakeClaims struct {
+	store      storage.Storage
+	pendingErr error
+	before     func(key string) // called by Pending first
+	pending    map[string]bool
+	staged     map[string]bool
+	promoting  map[string]bool
+	published  map[string]string // the publication token recorded per key
+	scopes     map[string]string // the scope each key was claimed for
+	gone       map[string]bool   // keys abandoned
+	claimed    []string
+	leases     []time.Time
+	abandoned  []string
+}
+
+func newFakeClaims(store storage.Storage) *fakeClaims {
+	return &fakeClaims{store: store, pending: map[string]bool{}, staged: map[string]bool{}, promoting: map[string]bool{}, published: map[string]string{}, scopes: map[string]string{}, gone: map[string]bool{}}
+}
+
+func (c *fakeClaims) Pending(_ context.Context, key, scope string, until time.Time) error {
+	if c.before != nil {
+		c.before(key)
+	}
+	if c.pendingErr != nil {
+		return c.pendingErr
+	}
+	c.claimed = append(c.claimed, key)
+	c.leases = append(c.leases, until)
+	c.pending[key] = true
+	c.scopes[key] = scope
+	return nil
+}
+
+func (c *fakeClaims) Stage(ctx context.Context, key, scope string, until time.Time) error {
+	if err := c.Pending(ctx, key, scope, until); err != nil {
+		return err
+	}
+	c.staged[key] = true
+	return nil
+}
+
+func (c *fakeClaims) Promote(_ context.Context, key, scope string, until time.Time) (bool, error) {
+	if !c.pending[key] || !c.staged[key] || c.scopes[key] != scope {
+		return false, nil
+	}
+	delete(c.pending, key)
+	c.promoting[key] = true
+	c.leases = append(c.leases, until)
+	return true, nil
+}
+
+// Lookup: a key the fake never claimed counts as held for the empty scope
+// (an existing record); one it abandoned is not live.
+func (c *fakeClaims) Lookup(_ context.Context, key string) (string, bool, error) {
+	if c.gone[key] {
+		return "", false, nil
+	}
+	s, claimed := c.scopes[key]
+	if !claimed {
+		return "", true, nil
+	}
+	return s, true, nil
+}
+
+func (c *fakeClaims) Publishing(_ context.Context, key, token string) error {
+	if !c.promoting[key] {
+		return errors.New("fake claims: not promoting")
+	}
+	c.published[key] = token
+	return nil
+}
+
+func (c *fakeClaims) Unpromote(_ context.Context, key string) error {
+	if c.promoting[key] {
+		delete(c.promoting, key)
+		delete(c.published, key)
+		c.pending[key] = true
+	}
+	return nil
+}
+
+func (c *fakeClaims) Abandon(ctx context.Context, key string) (bool, error) {
+	c.abandoned = append(c.abandoned, key)
+	if !c.pending[key] && !c.promoting[key] {
+		return false, nil
+	}
+	delete(c.pending, key)
+	delete(c.promoting, key)
+	c.gone[key] = true
+	if c.staged[key] {
+		if err := c.store.Delete(ctx, upload.StagingKey(key)); err != nil {
+			return true, err
+		}
+	}
+	return true, c.store.Delete(ctx, key)
+}
+
+// TestClaimComesFirst: Policy.Claims claims each generated key before
+// anything is stored or granted under it, for Save (and so Receive) and
+// Authorize alike; a failing claim fails the upload with nothing stored.
+func TestClaimComesFirst(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	cl := newFakeClaims(store)
+	cl.before = func(key string) {
+		if exists, _ := storage.Exists(ctx, store, key); exists {
+			t.Errorf("%s was stored before it was claimed", key)
+		}
+	}
+	p := images
+	p.Claims = cl
+	f, err := upload.Save(ctx, store, bytes.NewReader(png), "a.png", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cl.claimed) != 1 || cl.claimed[0] != f.Key {
+		t.Fatalf("claimed %v, want the stored key %s", cl.claimed, f.Key)
+	}
+	boom := errors.New("claims: database down")
+	cl.pendingErr = boom
+	before := len(store.Keys())
+	if _, err := upload.Save(ctx, store, bytes.NewReader(png), "a.png", p); !errors.Is(err, boom) {
+		t.Fatalf("Save with a failing claim = %v, want its error", err)
+	}
+	if len(store.Keys()) != before {
+		t.Fatal("an upload whose claim failed stored a file")
+	}
+}
+
+// TestClaimsDiscardThroughAbandon: under Policy.Claims, a failed upload
+// is cleaned up through Abandon: a failed Put drops its claim, and a Put
+// of unknown outcome deletes the pending key's file.
+func TestClaimsDiscardThroughAbandon(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	cl := newFakeClaims(store)
+	p := images
+	p.Claims = cl
+	// A body that fails after its first bytes: during the Put.
+	src := &failing{data: append(bytes.Clone(png), make([]byte, 2*upload.SniffBytes)...), err: errors.New("connection reset by peer")}
+	if _, err := upload.Save(ctx, store, src, "a.png", p); err == nil {
+		t.Fatal("Save of a failing body succeeded")
+	}
+	if len(cl.claimed) != 1 || len(cl.abandoned) != 1 || cl.abandoned[0] != cl.claimed[0] || len(cl.pending) != 0 {
+		t.Fatalf("claimed %v, abandoned %v: a failed Put must drop its claim", cl.claimed, cl.abandoned)
+	}
+	cl = newFakeClaims(store)
+	p.Claims = cl
+	if _, err := upload.Save(ctx, unknownOutcome{Store: store}, bytes.NewReader(png), "a.png", p); err == nil {
+		t.Fatal("Save of an unknown outcome succeeded")
+	}
+	if len(cl.abandoned) != 1 || len(store.Keys()) != 0 {
+		t.Fatalf("abandoned %v, stored %v: the pending file must be deleted through Abandon", cl.abandoned, store.Keys())
+	}
+}
+
+// slowBody sends data, then blocks until released (or for good).
+type slowBody struct {
+	data    []byte
+	release chan struct{}
+}
+
+func (b *slowBody) Read(p []byte) (int, error) {
+	if len(b.data) > 0 {
+		n := copy(p, b.data)
+		b.data = b.data[n:]
+		return n, nil
+	}
+	<-b.release
+	return 0, io.EOF
+}
+
+// TestClaimsLeaseTheUpload: under Policy.Claims, Save leases its key until
+// its deadline (Policy.UploadTimeout from the start), and a Put still
+// running then never publishes, even when its body resumes later: nothing
+// is stored after the claim's lease, and the claim is dropped.
+func TestClaimsLeaseTheUpload(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	cl := newFakeClaims(store)
+	p := images
+	p.Claims = cl
+	start := time.Now()
+	if _, err := upload.Save(ctx, store, bytes.NewReader(png), "a.png", p); err != nil {
+		t.Fatal(err)
+	}
+	if lease := cl.leases[0]; lease.Before(start.Add(upload.DefaultUploadTimeout)) || lease.After(time.Now().Add(upload.DefaultUploadTimeout)) {
+		t.Fatalf("lease = %s, want the default timeout from the start", lease.Sub(start))
+	}
+
+	cl = newFakeClaims(store)
+	p.Claims = cl
+	p.UploadTimeout = 100 * time.Millisecond
+	// The body resumes only after the deadline: a read in progress is not
+	// interrupted, but the Put must not publish once it has passed.
+	body := &slowBody{data: append(bytes.Clone(png), make([]byte, 2*upload.SniffBytes)...), release: make(chan struct{})}
+	time.AfterFunc(400*time.Millisecond, func() { close(body.release) })
+	before := len(store.Keys())
+	if _, err := upload.Save(ctx, store, body, "slow.png", p); err == nil {
+		t.Fatal("a Save past its deadline succeeded")
+	}
+	if len(store.Keys()) != before {
+		t.Fatal("a Save past its deadline stored a file")
+	}
+	if len(cl.claimed) != 1 || len(cl.pending) != 0 {
+		t.Fatalf("claimed %v, still pending %v: the aborted upload must drop its claim", cl.claimed, cl.pending)
+	}
+	if lease := cl.leases[0]; time.Since(lease) < 0 {
+		t.Fatalf("the Put ran past its lease (%s left)", time.Until(lease))
+	}
+	p.UploadTimeout = -time.Second
+	if _, err := upload.Save(ctx, store, bytes.NewReader(png), "a.png", p); err == nil {
+		t.Fatal("a negative UploadTimeout was accepted")
+	}
+}

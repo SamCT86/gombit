@@ -124,14 +124,19 @@ type ObjectInfo struct {
 	// was stored without one).
 	ContentType string
 	// ETag identifies this version of the object's bytes, when the driver
-	// has one (a content hash or the backend's ETag); it changes when the
-	// object is replaced with different bytes. A driver reports it from
-	// Put, Open, and Stat alike, or from none of them (empty: unsupported).
+	// has one; it changes when the object is replaced with different
+	// bytes. A driver reports it from Put, Open, and Stat alike, or from
+	// none of them (empty: unsupported). It is opaque: compare ETags, never
+	// compute or interpret one. (S3's depends on how the object was stored
+	// and on the bucket's encryption, and is not a checksum of the bytes in
+	// general; the local and memory drivers happen to use a SHA-256, which
+	// is not part of the contract.)
 	ETag string
-	// ModTime is when the object was last stored. Stat and Open always
-	// report it; the ObjectInfo Put returns may leave it zero when the
-	// backend does not say (S3's PutObject), rather than cost a second
-	// request.
+	// ModTime is when the object was last stored (for an object written
+	// once, as uploads under generated keys are, when it was created).
+	// Stat, Open, and List always report it; the ObjectInfo Put returns
+	// may leave it zero when the backend does not say (S3's PutObject),
+	// rather than cost a second request.
 	ModTime time.Time
 	// Metadata is the user metadata the object was stored with (nil when
 	// none). Every ObjectInfo a driver returns has a map of its own: the

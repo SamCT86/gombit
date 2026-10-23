@@ -31,9 +31,9 @@ instead of asking every mutating handler to re-implement it.
 | Cross-site request forges a mutating request | Every `POST`/`PUT`/`PATCH`/`DELETE` must echo the `gombit_csrf` cookie value as the `X-CSRF-Token` header (double-submit), **except** paths opted out via `framework.WithCSRFExemptPaths` (see [Exempting non-browser endpoints](#exempting-non-browser-endpoints-webhooks)), which must authenticate the caller themselves and must not trust the session cookie. A cross-origin page can trigger a cookie-bearing request but cannot read the CSRF cookie's value (browsers do not expose `Set-Cookie`/`document.cookie` across origins) or set a custom header on a simple cross-origin form submission, so it cannot produce a matching header. |
 | Cookie value is guessed or brute-forced | The CSRF token is 32 random bytes (`crypto/rand`) plus an HMAC-SHA256 signature over the token using `Config.Auth.JWTSecret`. `validCSRFTokenValue` checks the signature, not just cookie/header equality, so an attacker who can set *some* cookie on a subdomain ("cookie tossing") still cannot forge a token that verifies without the server secret. |
 | Session cookie is stolen off the wire | `Secure` is required in production (enforced by `config.Validate` / `gombit doctor`, see [Config](#config)) so cookies are never sent over plain HTTP once deployed. |
-| Session cookie is replayed after logout | Logout revokes the refresh token server-side ([`auth.Service.RevokeRefresh`](../auth/service.go)) and clears both cookies; a captured access JWT still fails once its short TTL (`GOMBIT_JWT_ACCESS_TTL`, default `15m`) expires, same as Bearer mode. |
+| Session cookie is replayed after logout | Logout revokes the refresh token server-side ([`auth.Service.RevokeRefresh`](../auth/service.go)) and clears both cookies; a captured access JWT fails immediately, because every request re-reads the refresh row it is bound to, same as Bearer mode. |
 | Cross-site cookie leakage on navigation | `SameSite=Lax` (default) blocks the cookie on cross-site sub-requests (XHR/fetch/form POST from another site) while still attaching it on top-level navigation (so a bookmarked link still works); `SameSite=Strict` blocks it even on top-level navigation from another site, at the cost of breaking session continuity across an external link into the app. Choose `Strict` for apps with no legitimate cross-site entry points. |
-| Reused/rotated refresh token | Identical to Bearer mode: `RotateRefresh` revokes the old token and presenting that revoked token again revokes the whole family (`errRefreshReuse`). Concurrent refresh of the current still-valid token shares one rotation and does not family-revoke the winner. |
+| Reused/rotated refresh token | Identical to Bearer mode: `RotateRefresh` revokes the old token, and presenting that rotated token again before it expires revokes all of the user's sessions (`errRefreshReuse`); once it has expired it is just invalid (401), and that 401 keeps the session cookies, since the token's successor can be the same browser's live session (on SQLite, within one app process: see `POST /auth/refresh` below). A token revoked by logout or session revocation is just invalid, and its 401 clears the session cookies, also when the revocation commits during a refresh of that token. Concurrent refresh of the current still-valid token shares one rotation and does not family-revoke the winner. |
 
 This is the **double-submit cookie** pattern, not the synchronizer-token
 pattern (no server-side per-session token store beyond the refresh token
@@ -139,9 +139,14 @@ differs: tokens travel in cookies, not JSON.
 | `GET` | `/auth/csrf` | Public, safe (CSRF-exempt) | Reuses a valid `gombit_csrf` cookie (refreshing its `Max-Age`); mints a new one only if missing/invalid. Body mirrors the value as `csrf_token`. |
 | `POST` | `/auth/register` | Public, CSRF-protected | Same as Bearer mode: creates a user, never sets `IsSuperuser`. |
 | `POST` | `/auth/login` | Public, CSRF-protected | Body `{email, password}`. On success, sets `gombit_access` + `gombit_refresh` cookies; body is the public user, not tokens. |
-| `POST` | `/auth/refresh` | Cookie (`gombit_refresh`), CSRF-protected | No request body; reads the refresh cookie. Rotates both session cookies. |
+| `POST` | `/auth/refresh` | Cookie (`gombit_refresh`), CSRF-protected | No request body; reads the refresh cookie. Rotates both session cookies. A refresh rejected with a 401 (no refresh cookie, or one that is unknown, revoked, expired or reused, or whose user is gone) clears both session cookies, as logout does, so the browser stops sending a dead refresh cookie; the OpenAPI document declares that 401, with its `Set-Cookie` header and the D10 error envelope, on the `refresh` operation. A 5xx leaves them, since the refresh token may still be valid for a retry. So does a 401 for a token that another rotation already replaced: a refresh that lost the race to a concurrent rotation of the same token on another instance, or one whose token has expired and has a successor. That rotation's response sets the session's new cookies in the same browser, and an expired refresh cookie has nothing to clear: its `Max-Age` is the token's lifetime. On SQLite this holds within one process; several app processes sharing one database file in WAL mode can still clear the cookies in that race, because a read there does not see a rotation another process commits during the transaction. A refresh whose unexpired token's session is revoked at that same moment (logout, or a session revocation from another device) finds no successor and clears them. |
 | `POST` | `/auth/logout` | Cookie (`gombit_refresh`), CSRF-protected | No request body; revokes the current refresh token and clears both session cookies. Idempotent. |
 | `GET` | `/me` | Cookie (`gombit_access`), safe | Same response shape as Bearer mode's `/me`. Missing or invalid session cookies are 401 D10 `authentication` and **omit** `WWW-Authenticate: Bearer` (RFC 7235: the challenge must name the scheme the resource uses). |
+| `GET` | `/auth/sessions` | Cookie (`gombit_access`), safe | Same sessions and response as Bearer mode; see [Sessions](auth.md#sessions). |
+| `DELETE` | `/auth/sessions/{id}` | Cookie (`gombit_access`), CSRF-protected | Revokes one session; 404 if `id` names no active session of the user. Revoking the current session also clears both session cookies. |
+| `DELETE` | `/auth/sessions?scope=others\|all` | Cookie (`gombit_access`), CSRF-protected | `others` keeps the current session and its cookies; `all` revokes every session and clears both session cookies. |
+| `POST` | `/auth/verify-email` | Public, CSRF-protected | Consumes the token from the verification message; see [Email verification](auth.md#email-verification). |
+| `POST` | `/auth/verify-email/resend` | Cookie (`gombit_access`), CSRF-protected | Mails a new verification link, at most once a minute. |
 
 ## Config
 
@@ -153,8 +158,9 @@ differs: tokens travel in cookies, not JSON.
 
 `GOMBIT_JWT_SECRET` / `GOMBIT_JWT_ACCESS_TTL` / `GOMBIT_JWT_REFRESH_TTL` are
 shared with Bearer mode (same access-JWT format; the secret also signs the
-CSRF token). See [`docs/auth.md`](auth.md#config) for those and the
-production JWT-secret-strength check.
+CSRF token). See [`docs/auth.md`](auth.md#config) for those, the rule that
+the refresh TTL is at least the access TTL, and the production
+JWT-secret-strength check.
 
 `gombit new --auth cookie` records the choice in `gombit.yaml` and writes
 `GOMBIT_AUTH_MODE=cookie` / `GOMBIT_COOKIE_SECURE=true` /

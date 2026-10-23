@@ -8,6 +8,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/gombit-dev/gombit/field"
 	"github.com/gombit-dev/gombit/resourcepolicy"
 	"github.com/gombit-dev/gombit/types"
+	"github.com/google/uuid"
 )
 
 // FieldsFrom derives a default []Field from model at registration time.
@@ -97,9 +99,15 @@ func FieldsFrom(model any) ([]Field, error) {
 			})
 			continue
 		}
+		typ := inferFieldType(sf)
+		if typ == "" {
+			// A kind with no admin wire: leave the column out rather than
+			// fail the registration.
+			continue
+		}
 		fields = append(fields, Field{
 			Name:      name,
-			Type:      inferFieldType(sf),
+			Type:      typ,
 			Required:  required,
 			ReadOnly:  readOnly,
 			WriteOnly: writeOnly,
@@ -368,12 +376,16 @@ func derivePK(sch *schema.Schema) (name, column string, ft FieldType, err error)
 }
 
 func matchSchemaField(sch *schema.Schema, f Field) *schema.Field {
+	// An explicit Column names the schema field, alone: the field's
+	// accessors and its SQL identity must be one schema field, so Name is
+	// not consulted (a Name matching an earlier field would otherwise bind
+	// the accessors to it while the column named another).
+	if f.Column != "" {
+		return sch.FieldsByDBName[f.Column]
+	}
 	for _, sf := range sch.Fields {
 		if sf == nil {
 			continue
-		}
-		if f.Column != "" && sf.DBName == f.Column {
-			return sf
 		}
 		if jsonFieldName(sf) == f.Name || sf.DBName == f.Name || sf.Name == f.Name {
 			return sf
@@ -466,6 +478,55 @@ func makeSetter(index []int, ft FieldType, destType reflect.Type) func(any, any)
 	}
 }
 
+func isIntegerKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return true
+	}
+	return false
+}
+
+// integerFits refuses an integer the destination's Go kind cannot hold, which
+// reflect.Value.Convert would wrap: 300 into an int8 became 44, -5 into a uint
+// 18446744073709551611, a value the database then could not read back
+// (issue #448).
+func integerFits(src reflect.Value, dest reflect.Type) error {
+	var n int64
+	switch src.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		n = src.Int()
+	case reflect.Float32, reflect.Float64:
+		// A field declared float (or json) over an integer Go field: Convert
+		// would truncate 3.7 to 3 and wrap 300 into an int8.
+		if !isIntegerKind(dest.Kind()) {
+			return nil
+		}
+		v, err := floatToInt64(src.Float())
+		if err != nil {
+			return err
+		}
+		n = v
+	default:
+		return nil
+	}
+	switch dest.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if reflect.Zero(dest).OverflowInt(n) {
+			bits := dest.Bits()
+			return fmt.Errorf("must be between %d and %d", int64(-1)<<(bits-1), int64(1)<<(bits-1)-1)
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if n < 0 || reflect.Zero(dest).OverflowUint(uint64(n)) {
+			if bits := dest.Bits(); bits < 64 {
+				return fmt.Errorf("must be between 0 and %d", uint64(1)<<bits-1)
+			}
+			return fmt.Errorf("must not be negative")
+		}
+	}
+	return nil
+}
+
 func convertTo(val any, dest reflect.Type) (reflect.Value, error) {
 	if val == nil {
 		return reflect.Zero(dest), nil
@@ -486,11 +547,24 @@ func convertTo(val any, dest reflect.Type) (reflect.Value, error) {
 	if src.Type().AssignableTo(dest) {
 		return src, nil
 	}
+	if err := integerFits(src, dest); err != nil {
+		return reflect.Value{}, err
+	}
 	// A named []byte that unmarshals JSON (types.JSON) is convertible from a
 	// string and is a byte slice, so the shortcuts below would store the raw
 	// characters and skip UnmarshalJSON. The document rules have to run first.
 	if out, err, ok := unmarshalDocument(val, src, dest); ok {
 		return out, err
+	}
+	// Go converts an integer to a string as the rune with that code point
+	// (123 becomes "{"); a number written to a string column is its digits.
+	if dest.Kind() == reflect.String {
+		switch src.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return reflect.ValueOf(strconv.FormatInt(src.Int(), 10)).Convert(dest), nil
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			return reflect.ValueOf(strconv.FormatUint(src.Uint(), 10)).Convert(dest), nil
+		}
 	}
 	if src.Type().ConvertibleTo(dest) {
 		return src.Convert(dest), nil
@@ -723,4 +797,46 @@ func validSlug(slug string) bool {
 		}
 	}
 	return true
+}
+
+// unchangedRoundedInteger reports whether raw, a JSON number beyond what a
+// float64 keeps exactly, is the stored value of an integer field, or of a
+// belongs_to over an integer key (its coerce type), as the admin's form
+// rounds it, so it is the value sent back, not an edit.
+func unchangedRoundedInteger(f *resolvedField, inst any, raw any) bool {
+	v, ok := raw.(float64)
+	if !ok || f.coerceType != TypeInteger || (v <= maxExactJSONInt && v >= -maxExactJSONInt) {
+		return false
+	}
+	cur := reflect.ValueOf(f.get(inst))
+	switch cur.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return float64(cur.Int()) == v
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return float64(cur.Uint()) == v
+	}
+	return false
+}
+
+// coerceTypeFor is the type a value for a field declared ft over a Go field of
+// type t is coerced as. A relation (belongs_to) value is its key column's: a
+// string key ("US", "007", "123") stays the string sent, byte for byte, where
+// parsing anything numeric-looking as an integer turned "123" into "{"
+// (issue #452); an integer key is an integer, a uuid key a uuid.
+func coerceTypeFor(ft FieldType, t reflect.Type) FieldType {
+	if ft != TypeRelation {
+		return ft
+	}
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch {
+	case t == reflect.TypeOf(uuid.UUID{}):
+		return TypeUUID
+	case t.Kind() == reflect.String:
+		return TypeString
+	case t.Kind() >= reflect.Int && t.Kind() <= reflect.Uint64:
+		return TypeInteger
+	}
+	return ft
 }

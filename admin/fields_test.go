@@ -411,6 +411,7 @@ func TestAdminWireSetMatchesVocabulary(t *testing.T) {
 	for _, declared := range []FieldType{
 		TypeString, TypeText, TypeInteger, TypeFloat, TypeDecimal, TypeBoolean,
 		TypeDateTime, TypeDate, TypeTime, TypeDuration, TypeUUID, TypeJSON, TypeRelation,
+		TypeFile, TypeImage,
 	} {
 		if _, ok := seen[string(declared)]; !ok {
 			t.Fatalf("admin type %q is not in the vocabulary admin wires", declared)
@@ -597,5 +598,27 @@ func TestManualPrimaryKeyCreateAndUpdate(t *testing.T) {
 	err = applyWrite(context.Background(), text, &struct{}{}, map[string]any{"id": ""}, true)
 	if !errors.As(err, &env) || !strings.Contains(strings.Join(env.Body.Fields["id"], " "), "is required") || stored != nil {
 		t.Fatalf("blank string key = %#v stored=%#v", err, stored)
+	}
+}
+
+// TestFieldsFromDerivesFileColumns: storage-backed columns get the file and
+// image widgets.
+func TestFieldsFromDerivesFileColumns(t *testing.T) {
+	type document struct {
+		gorm.Model
+		Title string       `gorm:"not null"`
+		File  *types.File  `gorm:"size:512;uniqueIndex"`
+		Cover *types.Image `gorm:"size:512;uniqueIndex"`
+	}
+	fields, err := FieldsFrom(&document{})
+	if err != nil {
+		t.Fatalf("FieldsFrom: %v", err)
+	}
+	types := map[string]FieldType{}
+	for _, f := range fields {
+		types[f.Name] = f.Type
+	}
+	if types["file"] != TypeFile || types["cover"] != TypeImage {
+		t.Fatalf("file columns derived as %v", types)
 	}
 }

@@ -171,6 +171,13 @@ func New(root string, opts ...Option) (*Store, error) {
 
 var _ storage.Storage = (*Store)(nil)
 
+var _ storage.BoundedWriter = (*Store)(nil)
+
+// BoundedWrites implements storage.BoundedWriter: a Put publishes with one
+// rename after checking its context, within the call, so nothing it wrote
+// is published after it returns.
+func (*Store) BoundedWrites() {}
+
 // Root returns the absolute root directory.
 func (s *Store) Root() string { return s.root }
 
@@ -626,6 +633,65 @@ type objectReader struct {
 }
 
 func (r *objectReader) Close() error { return r.f.Close() }
+
+var _ storage.Lister = (*Store)(nil)
+
+// List implements storage.Lister. Objects are stored by the hash of their
+// key, so it reads every object file's trailer: its cost is the whole
+// store, whatever the prefix. A damaged file (one that is not a readable
+// object) is skipped and reported to WithWarn, so one bad file does not
+// stop every cleanup that lists.
+func (s *Store) List(ctx context.Context, prefix string, fn func(storage.ObjectInfo) error) error {
+	err := filepath.WalkDir(filepath.Join(s.root, "objects"), func(path string, d fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // no objects yet, or a directory removed meanwhile
+		}
+		if err != nil {
+			return err
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		f, err := openShared(path) // a regular file (never a symlink: d.Type) under the store's own root, which only the store writes; shared, so a concurrent Put or Delete of it proceeds
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // deleted meanwhile
+		}
+		if err != nil {
+			return err
+		}
+		size, h, err := readTrailer(f)
+		_ = f.Close()
+		if errors.Is(err, errCorrupt) {
+			if s.warn != nil {
+				s.warn("local storage: skipping a damaged object file while listing", err)
+			}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(h.Key, prefix) {
+			return nil
+		}
+		if err := fn(h.info(size)); err != nil {
+			return fnError{err}
+		}
+		return nil
+	})
+	var fe fnError
+	if errors.As(err, &fe) {
+		return fe.err // fn's own error, as it returned it
+	}
+	return storage.Wrap("list", prefix, err)
+}
+
+// fnError carries the error of List's callback through the walk.
+type fnError struct{ err error }
+
+func (e fnError) Error() string { return e.err.Error() }
 
 // Stat implements storage.Storage.
 func (s *Store) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {

@@ -1,7 +1,8 @@
 # Bearer auth example
 
 Minimal `framework.App` with JWT secret + SQLite. `framework.New` mounts
-`POST /api/v1/auth/{register,login,refresh,logout}` and `GET /api/v1/me`.
+`POST /api/v1/auth/{register,login,refresh,logout}`, `GET /api/v1/me`, and
+the session-management routes under `/api/v1/auth/sessions`.
 
 ## Run
 
@@ -44,6 +45,64 @@ curl -sS -X POST http://127.0.0.1:8080/api/v1/auth/logout \
   -H 'Content-Type: application/json' \
   -d "{\"refresh_token\":\"$REFRESH\"}"
 ```
+
+## Sessions
+
+Each login is a session. Log in twice (for example, once per device) and
+manage the sessions from either one:
+
+```sh
+LOGIN=$(curl -sS -X POST http://127.0.0.1:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"ada@example.com","password":"correct-horse"}')
+ACCESS=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])' <<<"$LOGIN")
+curl -sS -X POST http://127.0.0.1:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"ada@example.com","password":"correct-horse"}' >/dev/null
+
+# list: the session making the request has "current": true
+SESSIONS=$(curl -sS http://127.0.0.1:8080/api/v1/auth/sessions -H "Authorization: Bearer $ACCESS")
+echo "$SESSIONS"
+OTHER=$(python3 -c 'import json,sys; print(next(s["id"] for s in json.load(sys.stdin)["data"] if not s["current"]))' <<<"$SESSIONS")
+
+# revoke one (ids change on every refresh: list again before revoking)
+curl -sS -X DELETE "http://127.0.0.1:8080/api/v1/auth/sessions/$OTHER" \
+  -H "Authorization: Bearer $ACCESS"
+
+# revoke every other session, or every session including this one
+curl -sS -X DELETE "http://127.0.0.1:8080/api/v1/auth/sessions?scope=others" \
+  -H "Authorization: Bearer $ACCESS"
+curl -sS -X DELETE "http://127.0.0.1:8080/api/v1/auth/sessions?scope=all" \
+  -H "Authorization: Bearer $ACCESS"
+```
+
+See [`docs/auth.md`](../../docs/auth.md#sessions) for the semantics.
+
+## Email verification
+
+Registration mails a verification message. This example sets no mailer
+(`framework.WithAuthMailer`), so in development the server logs the message
+instead, token included (`auth: email not sent (development LogMailer)`):
+
+```bash
+# the sessions above were revoked: log in again
+LOGIN=$(curl -sS -X POST http://127.0.0.1:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"ada@example.com","password":"correct-horse"}')
+ACCESS=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])' <<<"$LOGIN")
+
+# ask for a new link (once a minute; supersedes the earlier one)
+curl -sS -X POST http://127.0.0.1:8080/api/v1/auth/verify-email/resend \
+  -H "Authorization: Bearer $ACCESS"
+
+# post the latest token in the log; GET /me says "email_verified": false
+# until then
+curl -sS -X POST http://127.0.0.1:8080/api/v1/auth/verify-email \
+  -H 'Content-Type: application/json' -d '{"token":"<token from the log>"}'
+```
+
+See [`docs/auth.md`](../../docs/auth.md#email-verification) for the token
+rules, the mailer, and `auth.RequireVerifiedEmail`.
 
 The development JWT secret in `main.go` is not a production secret.
 Production config rejects secrets shorter than 32 characters.

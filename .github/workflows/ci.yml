@@ -60,6 +60,13 @@ jobs:
       - name: Build packages
         run: go build ./...
 
+      # Static Postgres/MySQL binaries are built without cgo (scratch and
+      # distroless images, the benchmark harness), so no package may need a
+      # cgo-only identifier to compile; the SQLite driver alone needs cgo, at
+      # run time (#439 review).
+      - name: Build packages without cgo
+        run: CGO_ENABLED=0 go build ./... && CGO_ENABLED=0 go vet ./database/...
+
       # Docs promise these compile. The tutorial example in particular is the
       # committed output of docs/tutorial.md and must not rot.
       - name: Build examples
@@ -68,7 +75,9 @@ jobs:
   # The storage drivers promise the same semantics on every platform the
   # release ships for, and Windows is the one whose file sharing and rename
   # rules differ (an open file can lock its name). Everything else runs on
-  # Ubuntu only, so the storage packages run here too.
+  # Ubuntu only, so the storage packages run here too, and so do the other
+  # packages whose file-replacement guarantee rests on a Windows-specific
+  # rename: internal/atomicfile, and upgrade (gombit.yaml's --write).
   storage-windows:
     name: Storage (Windows)
     needs: build
@@ -83,8 +92,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # storage/filefield's tests use the cgo SQLite driver: the runner's
+      # MinGW gcc builds it, and requiring cgo fails the build if it is
+      # missing instead of running the driver's stub.
       - name: Run storage tests
+        env:
+          CGO_ENABLED: "1"
         run: go test -count=1 ./storage/...
+
+      - name: Run file-replacement tests
+        run: go test -count=1 ./internal/atomicfile/... ./upgrade/...
 
   ci-scripts:
     name: CI script tests
@@ -138,6 +155,23 @@ jobs:
       - name: Run admin UI tests
         working-directory: internal/adminui
         run: npm ci && npm test
+
+      # The admin SPA ships as the committed dist/ (go:embed), so a source
+      # change that was not rebuilt never reaches a binary (issue #451: the
+      # #250 CSRF fix sat in src/ for weeks). Rebuild and fail on any
+      # difference, untracked hashed assets included, like contract-drift.
+      - name: Rebuild the admin UI
+        working-directory: internal/adminui
+        run: npm run build
+
+      - name: Fail on admin UI dist drift
+        run: |
+          if [ -n "$(git status --porcelain -- internal/adminui/dist)" ]; then
+            git status --porcelain -- internal/adminui/dist
+            git diff --stat -- internal/adminui/dist
+            echo "::error::internal/adminui/dist is stale: run 'npm run build' in internal/adminui and commit dist/ with the source change"
+            exit 1
+          fi
 
       # Parallel packages all shell out to npx; a cold _npx extract races
       # (TAR_ENTRY_ERROR / missing js-yaml) and fails client generation tests.
@@ -528,6 +562,12 @@ jobs:
           go test -tags integration ./types \
             -types.postgres-dsn \
             'postgres://gombit:gombit@127.0.0.1:5432/gombit?sslmode=disable'
+          go test -tags integration ./storage/filefield \
+            -filefield.postgres-dsn \
+            'postgres://gombit:gombit@127.0.0.1:5432/gombit?sslmode=disable'
+          go test -tags integration ./storage/claims \
+            -claims.postgres-dsn \
+            'postgres://gombit:gombit@127.0.0.1:5432/gombit?sslmode=disable'
 
       # Separate database from the auth/database/admin tests above: gin-gorm's
       # User model maps to a "users" table, same as auth.User, and the two
@@ -728,6 +768,12 @@ jobs:
             'gombit:gombit@tcp(127.0.0.1:3306)/gombit?parseTime=true'
           go test -tags integration ./resourcegen \
             -resourcegen.mysql-dsn \
+            'gombit:gombit@tcp(127.0.0.1:3306)/gombit?parseTime=true'
+          go test -tags integration ./storage/filefield \
+            -filefield.mysql-dsn \
+            'gombit:gombit@tcp(127.0.0.1:3306)/gombit?parseTime=true'
+          go test -tags integration ./storage/claims \
+            -claims.mysql-dsn \
             'gombit:gombit@tcp(127.0.0.1:3306)/gombit?parseTime=true'
 
   migrations-sqlite:

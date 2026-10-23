@@ -30,14 +30,14 @@ func WithEmbeddedFrontend(fsys fs.FS) Option {
 	}
 }
 
-func mountEmbeddedFrontend(router *gin.Engine, fsys fs.FS, apiPrefix string) {
+func mountEmbeddedFrontend(router *gin.Engine, fsys fs.FS, apiPrefix string, storageOrigins ...string) {
 	if router == nil || fsys == nil {
 		return
 	}
 	if !hasIndexHTML(fsys) {
 		return
 	}
-	router.NoRoute(embeddedFrontendHandler(fsys, apiPrefix))
+	router.NoRoute(embeddedFrontendHandler(fsys, apiPrefix, spaCSP(storageOrigins)))
 }
 
 func hasIndexHTML(fsys fs.FS) bool {
@@ -45,26 +45,26 @@ func hasIndexHTML(fsys fs.FS) bool {
 	return err == nil && info != nil && !info.IsDir()
 }
 
-func embeddedFrontendHandler(fsys fs.FS, apiPrefix string) gin.HandlerFunc {
+func embeddedFrontendHandler(fsys fs.FS, apiPrefix string, csp []string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
-			c.AbortWithStatus(http.StatusNotFound)
+			abortNotFound(c)
 			return
 		}
 
 		urlPath := path.Clean("/" + c.Request.URL.Path)
 		if isReservedFrontendPath(urlPath, apiPrefix) {
-			c.AbortWithStatus(http.StatusNotFound)
+			abortNotFound(c)
 			return
 		}
 
 		name := strings.TrimPrefix(urlPath, "/")
 		if name == "index.html" {
-			serveIndexHTML(c, fsys, apiPrefix)
+			serveIndexHTML(c, fsys, apiPrefix, csp)
 			return
 		}
 		if name != "" && name != "." && fs.ValidPath(name) {
-			if serveEmbeddedFile(c, fsys, name) {
+			if serveEmbeddedFile(c, fsys, name, csp) {
 				return
 			}
 		}
@@ -72,7 +72,7 @@ func embeddedFrontendHandler(fsys fs.FS, apiPrefix string) gin.HandlerFunc {
 		// SPA fallback: only GET and HEAD reach this handler at all (the
 		// guard above), and serveIndexHTML writes via writeBytes, which
 		// already skips the body for HEAD — so no method check belongs here.
-		serveIndexHTML(c, fsys, apiPrefix)
+		serveIndexHTML(c, fsys, apiPrefix, csp)
 	}
 }
 
@@ -113,6 +113,20 @@ const spaContentSecurityPolicy = "default-src 'self'; script-src 'self'; style-s
 
 var spaContentSecurityPolicyValue = []string{spaContentSecurityPolicy}
 
+// spaCSP is the SPA Content-Security-Policy, with storageOrigins (where the
+// store's URLs point, when that is another origin: an S3 bucket, a CDN)
+// allowed for images and requests, so a page can show a stored image and
+// upload directly to the store.
+func spaCSP(storageOrigins []string) []string {
+	if len(storageOrigins) == 0 {
+		return spaContentSecurityPolicyValue
+	}
+	extra := " " + strings.Join(storageOrigins, " ")
+	csp := strings.Replace(spaContentSecurityPolicy, "img-src 'self' data:", "img-src 'self' data:"+extra, 1)
+	csp = strings.Replace(csp, "connect-src 'self'", "connect-src 'self'"+extra, 1)
+	return []string{csp}
+}
+
 // applyBrowserSecurityHeaders promotes a response from the API/JSON security
 // baseline (set by securityHeadersMiddleware) to the full browser policy that
 // an HTML document rendered in a browser needs (issue #267 / PERF-9): the
@@ -126,14 +140,14 @@ var spaContentSecurityPolicyValue = []string{spaContentSecurityPolicy}
 // is not on the JSON hot path, so the map growth it may cause past the 8-header
 // threshold is acceptable here — the allocation budget in issue #267 is about
 // the default API response, not HTML documents.
-func applyBrowserSecurityHeaders(c *gin.Context) {
+func applyBrowserSecurityHeaders(c *gin.Context, csp []string) {
 	header := c.Writer.Header()
-	header["Content-Security-Policy"] = spaContentSecurityPolicyValue
+	header["Content-Security-Policy"] = csp
 	header["Referrer-Policy"] = referrerPolicyValue
 	header["X-Frame-Options"] = frameOptionsValue
 }
 
-func serveEmbeddedFile(c *gin.Context, fsys fs.FS, name string) bool {
+func serveEmbeddedFile(c *gin.Context, fsys fs.FS, name string, csp []string) bool {
 	f, err := fsys.Open(name)
 	if err != nil {
 		return false
@@ -145,11 +159,27 @@ func serveEmbeddedFile(c *gin.Context, fsys fs.FS, name string) bool {
 		return false
 	}
 
-	if name == "index.html" {
-		applyBrowserSecurityHeaders(c)
-	}
+	// The security policy follows the content type actually served, not a file
+	// name (issue #434): every HTML document in the embedded build (a
+	// multi-page Vite app's /about/index.html, a static /legal.html) is a page
+	// rendered in a browser and needs the browser policy, or the API policy's
+	// default-src 'none' blocks its scripts, styles and images. The type is
+	// decided here, the way http.ServeContent would decide it, and set on the
+	// response so ServeContent uses it unchanged.
+	ctype := mime.TypeByExtension(path.Ext(name))
 
 	if rs, ok := f.(io.ReadSeeker); ok {
+		if ctype == "" {
+			sniffed, err := sniffContentType(rs)
+			if err != nil {
+				return false
+			}
+			ctype = sniffed
+		}
+		if isHTMLContentType(ctype) {
+			applyBrowserSecurityHeaders(c, csp)
+		}
+		c.Writer.Header().Set("Content-Type", ctype)
 		http.ServeContent(c.Writer, c.Request, info.Name(), info.ModTime(), rs)
 		return true
 	}
@@ -158,25 +188,44 @@ func serveEmbeddedFile(c *gin.Context, fsys fs.FS, name string) bool {
 	if err != nil {
 		return false
 	}
-	writeBytes(c, contentTypeFor(name), data)
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	if isHTMLContentType(ctype) {
+		applyBrowserSecurityHeaders(c, csp)
+	}
+	writeBytes(c, ctype, data)
 	return true
 }
 
-func serveIndexHTML(c *gin.Context, fsys fs.FS, apiPrefix string) {
+// sniffContentType detects the type of a file with no recognised extension
+// from its first 512 bytes, as http.ServeContent does, and rewinds it.
+func sniffContentType(rs io.ReadSeeker) (string, error) {
+	var buf [512]byte
+	n, _ := io.ReadFull(rs, buf[:])
+	if _, err := rs.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	return http.DetectContentType(buf[:n]), nil
+}
+
+// isHTMLContentType reports whether ctype is an HTML document type, the
+// responses that need the browser security policy.
+func isHTMLContentType(ctype string) bool {
+	mediaType, _, err := mime.ParseMediaType(ctype)
+	if err != nil {
+		return false
+	}
+	return mediaType == "text/html" || mediaType == "application/xhtml+xml"
+}
+
+func serveIndexHTML(c *gin.Context, fsys fs.FS, apiPrefix string, csp []string) {
 	data, err := fs.ReadFile(fsys, "index.html")
 	if err != nil {
-		c.AbortWithStatus(http.StatusNotFound)
+		abortNotFound(c)
 		return
 	}
 	data = injectAPIPrefixHTML(data, apiPrefix)
-	applyBrowserSecurityHeaders(c)
+	applyBrowserSecurityHeaders(c, csp)
 	writeBytes(c, "text/html; charset=utf-8", data)
-}
-
-func contentTypeFor(name string) string {
-	ctype := mime.TypeByExtension(path.Ext(name))
-	if ctype == "" {
-		return "application/octet-stream"
-	}
-	return ctype
 }

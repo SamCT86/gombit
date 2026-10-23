@@ -85,6 +85,10 @@ var (
 	// ErrMalformed: the request is not a well-formed upload (not
 	// multipart, a broken body, or more than one file).
 	ErrMalformed = errors.New("upload: malformed request")
+	// ErrExpired: a key with no live claim under Policy.Claims (Confirm):
+	// its upload expired, was discarded (a failed write abandons the
+	// uploads it named), or was never granted. Upload the file again.
+	ErrExpired = errors.New("upload: the upload has expired or was discarded")
 )
 
 // CleanupError reports a key that may still hold a file after a failed
@@ -137,6 +141,53 @@ type Policy struct {
 	// signed URL (DefaultGrantExpiry when zero; whole seconds, at most
 	// storage.MaxURLExpiry).
 	GrantExpiry time.Duration
+	// UploadTimeout bounds how long the application may take to write a
+	// claimed key under Claims (DefaultUploadTimeout when zero): Save's and
+	// Receive's Put, and Confirm's copy of a staged upload, are aborted
+	// then, before they publish, so the key's claim can lease it until a
+	// known time (storage/claims). Unused without Claims.
+	UploadTimeout time.Duration
+	// Claims, when set, puts uploads under an ownership protocol
+	// (storage/claims: a *claims.Claims). Each generated key is claimed
+	// (Pending) before anything is stored or granted under it, and a
+	// failure to claim fails the upload. A file that fails (an invalid
+	// request, a refused confirmation) is deleted through Abandon, which
+	// deletes it only while its claim is pending: never a file a record
+	// holds, nor one under a key that was never claimed.
+	Claims Claimer
+	// Scope names who the uploads are for under Claims (a field:
+	// "document.attachment"), at most 255 bytes. Each key is claimed for
+	// it, and Confirm accepts only a key claimed for the same scope: a
+	// grant from one field cannot be attached to another, whatever their
+	// prefixes. Give every policy sharing a store under Claims its own.
+	Scope string
+}
+
+// Claimer is the ownership protocol uploads take part in; *claims.Claims
+// implements it.
+type Claimer interface {
+	// Pending claims key for scope, which nothing has been stored under
+	// yet, leased until until: Save publishes nothing under key after it.
+	Pending(ctx context.Context, key, scope string, until time.Time) error
+	// Stage claims key for scope, for a direct upload to StagingKey(key)
+	// (Authorize).
+	Stage(ctx context.Context, key, scope string, until time.Time) error
+	// Promote moves a key staged for scope to promoting, leased until
+	// until, and reports whether it did: only then may Confirm copy the
+	// staged object to key.
+	Promote(ctx context.Context, key, scope string, until time.Time) (bool, error)
+	// Lookup reports the scope key is claimed for, and whether that claim
+	// is live (not being deleted, nor gone).
+	Lookup(ctx context.Context, key string) (scope string, live bool, err error)
+	// Publishing records the token of the promotion's copy on the key's
+	// promoting claim, before it is published (storage.PreparePublish).
+	Publishing(ctx context.Context, key, token string) error
+	// Unpromote moves a promoting key back to pending (nothing was copied).
+	Unpromote(ctx context.Context, key string) error
+	// Abandon deletes the object of key and its claim if the claim is
+	// still pending, and reports whether it did; it leaves any other key
+	// alone.
+	Abandon(ctx context.Context, key string) (bool, error)
 }
 
 // DefaultGrantExpiry is how long a direct upload grant works unless
@@ -144,13 +195,42 @@ type Policy struct {
 // short enough that a leaked grant is soon useless.
 const DefaultGrantExpiry = 15 * time.Minute
 
+// StagingPrefix starts the keys uploads under Policy.Claims are staged at
+// (StagingKey): direct uploads always, and Save's on a remote store. It is
+// a reserved namespace at the root of the store: claims.SweepStaging
+// deletes any object under it whose key has no live claim, whoever stored
+// it. Store nothing else there; Policy prefixes may not start with it.
+const StagingPrefix = "_staging/"
+
+// StagingKey is where a direct upload of key is uploaded under
+// Policy.Claims: StagingPrefix and key. Only Confirm writes key itself.
+func StagingKey(key string) string { return StagingPrefix + key }
+
+// uploadTimeout is p.UploadTimeout, or DefaultUploadTimeout.
+func uploadTimeout(p Policy) time.Duration {
+	if p.UploadTimeout == 0 {
+		return DefaultUploadTimeout
+	}
+	return p.UploadTimeout
+}
+
+// DefaultUploadTimeout is how long Save and Receive may take to store a
+// file under Policy.Claims unless Policy.UploadTimeout says otherwise.
+const DefaultUploadTimeout = time.Hour
+
 // File is a stored upload.
 type File struct {
 	storage.ObjectInfo
 	// Filename is the client's filename, cleaned (empty when it sent none):
-	// for display and Content-Disposition only, never a path.
+	// for display and Content-Disposition only, never a path. It is the
+	// stored FilenameMetadata (ObjectInfo.StoredFilename).
 	Filename string
 }
+
+// Validate reports whether p is a usable policy (the check every function
+// here makes first): a positive MaxBytes, Types listed, a valid Prefix and
+// Metadata, a GrantExpiry within storage.MaxURLExpiry.
+func (p Policy) Validate() error { return p.validate() }
 
 func (p Policy) validate() error {
 	switch {
@@ -166,6 +246,11 @@ func (p Policy) validate() error {
 	if err := storage.ValidatePrefix(p.Prefix); err != nil {
 		return fmt.Errorf("upload: Policy.Prefix: %v", err) // the server's mistake, not an invalid request
 	}
+	if strings.HasPrefix(p.Prefix, StagingPrefix) {
+		return fmt.Errorf("upload: Policy.Prefix %q is under %q, which direct uploads are staged under", p.Prefix, StagingPrefix)
+	}
+	// (A staged upload's key is StagingPrefix and the key: claimed keys are
+	// at most claims.MaxKeyLen, 512 bytes, so it always fits.)
 	if err := storage.ValidateKey(p.Prefix + strings.Repeat("0", idHexLen)); err != nil {
 		return fmt.Errorf("upload: Policy.Prefix %q leaves no room for a generated key: %v", p.Prefix, err)
 	}
@@ -173,6 +258,12 @@ func (p Policy) validate() error {
 		if !validType(t) {
 			return fmt.Errorf(`upload: Policy.Types entry %q: want a lowercase "type/subtype", "type/*", or "*/*"`, t)
 		}
+	}
+	if len(p.Scope) > 255 {
+		return fmt.Errorf("upload: Policy.Scope is %d bytes, more than 255", len(p.Scope))
+	}
+	if p.UploadTimeout < 0 {
+		return fmt.Errorf("upload: Policy.UploadTimeout must not be negative, not %s", p.UploadTimeout)
 	}
 	if p.GrantExpiry < 0 || p.GrantExpiry > storage.MaxURLExpiry || p.GrantExpiry%time.Second != 0 {
 		return fmt.Errorf("upload: Policy.GrantExpiry must be whole seconds between 0 (the default) and %s, not %s", storage.MaxURLExpiry, p.GrantExpiry)
@@ -263,6 +354,31 @@ func save(ctx context.Context, store storage.Storage, src io.Reader, filename st
 	if err != nil {
 		return File{}, err
 	}
+	// Under Claims, the store must be ownable (storage.CheckOwnable). A
+	// storage.BoundedWriter's Put runs under the lease's deadline: it can
+	// never publish after it. A storage.Publisher (S3) cannot prove that a
+	// Put which went unanswered will not publish later, so there the file
+	// is put at the staging key and promoted, like a direct upload: only a
+	// fenceable copy ever writes the claimed key.
+	putCtx, target, staged := ctx, key, false
+	var deadline time.Time
+	if p.Claims != nil {
+		deadline = time.Now().Add(uploadTimeout(p))
+		if err := storage.CheckOwnable(store); err != nil {
+			return File{}, fmt.Errorf("upload: claims: %w", err)
+		}
+		if _, staged = store.(storage.Publisher); staged {
+			if err := p.Claims.Stage(ctx, key, p.Scope, deadline); err != nil {
+				return File{}, fmt.Errorf("upload: claim %q: %w", key, err)
+			}
+			target = StagingKey(key)
+		} else if err := claim(ctx, p, key, deadline); err != nil {
+			return File{}, err
+		}
+		var cancel context.CancelFunc
+		putCtx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 	filename = CleanFilename(filename)
 	md := maps.Clone(p.Metadata)
 	if filename != "" {
@@ -271,7 +387,7 @@ func save(ctx context.Context, store storage.Storage, src io.Reader, filename st
 		}
 		filename = fitMetadata(md, filename)
 	}
-	info, err := store.Put(ctx, key, io.MultiReader(bytes.NewReader(head), src), storage.PutOptions{
+	info, err := store.Put(putCtx, target, io.MultiReader(bytes.NewReader(head), src), storage.PutOptions{
 		ContentType: contentType,
 		Metadata:    md,
 		Size:        size,
@@ -279,13 +395,27 @@ func save(ctx context.Context, store storage.Storage, src io.Reader, filename st
 	if errors.Is(err, storage.ErrUnknownOutcome) {
 		// The store may hold the file under key: no one else will ever use
 		// this key, so delete it, then report the failure as it now stands.
-		if derr := discard(ctx, store, key); derr != nil {
+		if derr := discard(ctx, store, p, key); derr != nil {
 			return File{}, errors.Join(source.classify(ctx, err), &CleanupError{Key: key, Err: derr})
 		}
 		return File{}, source.classify(ctx, settled(key, err))
 	}
 	if err != nil {
+		unclaim(ctx, p, key)
 		return File{}, source.classify(ctx, err)
+	}
+	if staged {
+		promoted, err := p.Claims.Promote(ctx, key, p.Scope, deadline)
+		if err == nil && !promoted {
+			err = fmt.Errorf("%w: the claim of %q is no longer pending", storage.ErrUnavailable, key)
+		}
+		if err != nil {
+			unclaim(ctx, p, key)
+			return File{}, fmt.Errorf("upload: promote %q: %w", key, err)
+		}
+		if info, err = promote(ctx, store, p, key, deadline); err != nil {
+			return File{}, err
+		}
 	}
 	return File{ObjectInfo: info, Filename: filename}, nil
 }
@@ -347,6 +477,27 @@ func fitMetadata(md map[string]string, filename string) string {
 	}
 	delete(md, FilenameMetadata)
 	return ""
+}
+
+// claim claims key (Policy.Claims), leased until until, before anything is
+// stored under it.
+func claim(ctx context.Context, p Policy, key string, until time.Time) error {
+	if p.Claims == nil {
+		return nil
+	}
+	if err := p.Claims.Pending(ctx, key, p.Scope, until); err != nil {
+		return fmt.Errorf("upload: claim %q: %w", key, err)
+	}
+	return nil
+}
+
+// unclaim drops the claim of key, under which nothing was stored (a failed
+// Put, a grant that could not be made). If that fails too, the claim stays
+// pending, and the protocol's sweep drops it later.
+func unclaim(ctx context.Context, p Policy, key string) {
+	if p.Claims != nil {
+		_ = discard(ctx, nil, p, key)
+	}
 }
 
 // newKey returns prefix followed by a random 128-bit id, idHexLen hex
@@ -425,7 +576,7 @@ func Receive(store storage.Storage, r *http.Request, p Policy) (File, error) {
 	var fileBytes, fieldBytes int64 // the file's bytes; other fields' bytes
 	fail := func(err error) (File, error) {
 		if stored {
-			if derr := discard(ctx, store, file.Key); derr != nil {
+			if derr := discard(ctx, store, p, file.Key); derr != nil {
 				err = errors.Join(err, &CleanupError{Key: file.Key, Err: derr})
 			}
 		}
@@ -577,10 +728,15 @@ func clientGone(ctx context.Context, err error) error {
 
 // discard deletes a stored file that turned out to be part of an invalid
 // request, even when the request's context has ended (a client that went
-// away mid-request).
-func discard(ctx context.Context, store storage.Storage, key string) error {
+// away mid-request). Under Policy.Claims it abandons the key instead, which
+// deletes the file only while its claim is pending.
+func discard(ctx context.Context, store storage.Storage, p Policy, key string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
+	if p.Claims != nil {
+		_, err := p.Claims.Abandon(ctx, key)
+		return err
+	}
 	return store.Delete(ctx, key)
 }
 
@@ -620,7 +776,7 @@ func (l *limitReader) tooLarge() error {
 
 // MapError maps an upload error to a D10 error for a handler: ErrTooLarge
 // (or an http.MaxBytesError) is 413 payload_too_large; ErrType, ErrNoFile,
-// and ErrMalformed are validation errors; anything else is a storage error
+// ErrMalformed and ErrExpired are validation errors; anything else is a storage error
 // (storage.MapError).
 func MapError(ctx context.Context, err error) error {
 	var maxBytes *http.MaxBytesError
@@ -635,6 +791,8 @@ func MapError(ctx context.Context, err error) error {
 		return contract.WithContext(ctx, contract.Validation("No file was uploaded.", nil))
 	case errors.Is(err, ErrMalformed):
 		return contract.WithContext(ctx, contract.Validation("The upload could not be read.", nil))
+	case errors.Is(err, ErrExpired):
+		return contract.WithContext(ctx, contract.Validation("The upload has expired or was discarded; upload the file again.", nil))
 	}
 	return storage.MapError(ctx, err, "file not found", "could not store the file")
 }

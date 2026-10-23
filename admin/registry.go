@@ -66,10 +66,16 @@ type registered struct {
 	m2m         []*m2mBinding             // many-to-many fields synced on write (#223)
 	hasMany     []*relationRead           // has_many fields, read-only (preload + ids) (#223)
 	version     *versionField             // optimistic-lock column, if the model has one
+	files       []*resolvedField          // storage-backed fields (file, image)
 	// serverRequired names columns a hook must set when Fields were derived.
 	// They may be absent from fields when the policy hides them. Create fails
 	// only when the body did not set the column.
 	serverRequired []string
+	// omitOnUpdate names the storage-backed columns the admin does not
+	// write through the upload protocol: an update leaves them out, so it
+	// never writes back the key it loaded over one a concurrent
+	// claims.Update replaced.
+	omitOnUpdate []string
 }
 
 // versionField describes a model's integer optimistic-locking column (named
@@ -86,8 +92,12 @@ type resolvedField struct {
 	Field
 	column  string
 	pointer bool
-	get     func(inst any) any
-	set     func(inst any, raw any) error
+	// coerceType is the type a written or filtered value is coerced as: the
+	// field's Type, except for a belongs_to relation, whose value is coerced
+	// as its key column's type (a string key stays a string, issue #452).
+	coerceType FieldType
+	get        func(inst any) any
+	set        func(inst any, raw any) error
 }
 
 // implicitColumn is a GORM timestamp allowed in List/Ordering without a Field.
@@ -152,4 +162,12 @@ func registryFor(api huma.API) (*registry, bool) {
 func storeRegistry(api huma.API, reg *registry) bool {
 	_, loaded := registries.LoadOrStore(api, reg)
 	return !loaded
+}
+
+// valueType is the type a value for f is coerced as (see coerceType).
+func (f *resolvedField) valueType() FieldType {
+	if f.coerceType != "" {
+		return f.coerceType
+	}
+	return f.Type
 }

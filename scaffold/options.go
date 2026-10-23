@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+
+	"golang.org/x/mod/module"
+	"golang.org/x/term"
 )
 
 const (
@@ -24,7 +27,7 @@ const (
 	// DefaultModulePrefix is the module path used when --module is omitted.
 	DefaultModulePrefix = "github.com/example"
 
-	generatedGoVersion = "1.26.0"
+	generatedGoVersion = "1.26.9"
 )
 
 var (
@@ -56,11 +59,11 @@ type Options struct {
 	// skipAtlas bypasses the initial bootstrap migration in tests that stub
 	// go.sum population without a real go.mod/go.sum, mirroring resourcegen's
 	// own skipAtlas seam.
-	skipAtlas        bool
-	Stdin            io.Reader
-	Stdout           io.Writer
-	Stderr           io.Writer
-	IsTTY            func() bool
+	skipAtlas bool
+	Stdin     io.Reader
+	Stdout    io.Writer
+	Stderr    io.Writer
+	IsTTY     func() bool
 }
 
 func (opts *Options) normalize() error {
@@ -165,17 +168,23 @@ func validateName(name string) error {
 	return nil
 }
 
-func validateModule(module string) error {
-	if module == "" {
+func validateModule(modulePath string) error {
+	if modulePath == "" {
 		return errors.New("scaffold: module path is required")
 	}
-	if strings.Contains(module, "\\") || strings.Contains(module, " ") {
-		return fmt.Errorf("scaffold: invalid module path %q", module)
-	}
-	for _, part := range strings.Split(module, "/") {
-		if part == "" || part == "." || part == ".." {
-			return fmt.Errorf("scaffold: invalid module path %q", module)
+	if err := module.CheckImportPath(modulePath); err != nil {
+		var invalid *module.InvalidPathError
+		if errors.As(err, &invalid) {
+			return fmt.Errorf("scaffold: invalid module path %q: %v", modulePath, invalid.Err)
 		}
+		return fmt.Errorf("scaffold: invalid module path %q: %w", modulePath, err)
+	}
+	// Go 1.26 reserves these virtual module paths for toolchain directives.
+	if modulePath == "go" || modulePath == "toolchain" {
+		return fmt.Errorf("scaffold: invalid module path %q: module path is reserved", modulePath)
+	}
+	if _, _, ok := module.SplitPathVersion(modulePath); !ok {
+		return fmt.Errorf("scaffold: invalid module path %q: invalid version", modulePath)
 	}
 	return nil
 }
@@ -194,9 +203,5 @@ func stdinIsTTY(r io.Reader) bool {
 	if !ok {
 		return false
 	}
-	info, err := file.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(file.Fd()))
 }

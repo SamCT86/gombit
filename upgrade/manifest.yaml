@@ -1,0 +1,629 @@
+# Gombit's compatibility manifest (docs/upgrade.md § The compatibility
+# manifest): every upgrade-relevant change of each release, classified. The
+# upgrade tooling plans from it, and the upgrade notes (docs/upgrade-notes.md,
+# the GitHub release body) are rendered from it. Regenerate the notes with
+#   go test ./upgrade -run TestUpgradeNotesDoc -update
+#
+# Every release from the first one covered is listed, even with no changes: an
+# unlisted version has no known upgrade path. The next release's changes
+# collect under `unreleased`, renamed to its version when it is cut
+# (docs/releasing.md). Audit `git log vPREVIOUS..HEAD`, not only the
+# CHANGELOG; TestChangelogIsDeclared checks that every issue the CHANGELOG's
+# Unreleased section links is in some change's refs, or exempt with a reason.
+#
+# A change has:
+#   id        kebab-case, unique across the manifest
+#   kind      automatic (the tooling applies it: names an `action`),
+#             manual (the developer acts: `details` says how), or
+#             informational (nothing to do, worth knowing)
+#   breaking  whether an app that relies on documented (or reasonably
+#             relied-on) behavior can stop building, starting or working
+#             until it acts; a fix only code matching undocumented output
+#             notices is not breaking
+#   area      api, behavior, cli, client, config, dependency, scaffold, schema
+#             or security
+#   summary   one line; details: Markdown; refs: issue/PR numbers
+#   schema    (area schema) the framework-owned tables it adds, alters or
+#             removes: {model: auth.RefreshToken, table: refresh_tokens,
+#             change: altered}; a join table a model declares says
+#             join: true, a change that loses data destructive: true;
+#             TestFrameworkSchemaIsDeclared holds the framework's models
+#             to them (docs/upgrade.md)
+#   deprecates  the framework APIs it deprecates, as gombit upgrade check
+#             names them (database.KeepStoredZeros): a "Deprecated: since
+#             vX.Y.Z" paragraph must name the release that declares it
+format: 1
+releases:
+  - version: v0.6.1
+    # The first release the manifest covers: upgrades are described from here.
+
+  - version: v0.7.0
+    changes:
+      - id: admin-composite-primary-keys
+        kind: manual
+        breaking: true
+        area: api
+        summary: "`admin.Register` refuses a model whose primary key spans several columns."
+        details: |
+          Such a model used to register, and the admin addressed its rows by
+          the first key column alone. Startup now fails with `admin: <Model>
+          has a composite primary key, which is not supported`. Give the
+          model a single-column primary key, or keep it out of the admin
+          registry.
+        refs: [453]
+
+      - id: stop-hook-shutdown-budget
+        kind: manual
+        area: behavior
+        summary: "`OnStop` hooks get their own shutdown-timeout budget, so a full shutdown can take longer."
+        details: |
+          A shutdown can now take the drain delay plus up to twice the
+          shutdown timeout (`framework.WithShutdownTimeout`, 10s by default).
+          Check that the orchestrator's termination grace period (Kubernetes
+          `terminationGracePeriodSeconds`, ECS `stopTimeout`) still covers
+          it.
+        refs: [431]
+
+      - id: sanitize-html-stray-angle-bracket
+        kind: informational
+        area: security
+        summary: "`framework.SanitizeHTML` keeps text after a stray `<` when the value also has a real tag."
+        details: |
+          That tail comes back as `SanitizeHTML` returns a value with no
+          complete tag: raw, undecoded input. It is no safer than that case;
+          escape on output as before.
+        refs: [433]
+
+      - id: admin-csp-allows-storage-origin
+        kind: informational
+        area: security
+        summary: "The admin and embedded SPA pages' Content-Security-Policy allows the object store's origin for images and requests."
+        details: |
+          With a remote store (an S3 bucket, a CDN), its origin joins the
+          policy's `img-src` and `connect-src`, so file previews and direct
+          uploads work. Review it if the store's origin is shared with
+          content you do not control.
+        refs: [330]
+
+      - id: request-timeout-response-reaches-client
+        kind: informational
+        area: behavior
+        summary: "With `GOMBIT_HTTP_REQUEST_TIMEOUT` set, the 504 a timed-out handler writes reaches the client; `WriteTimeout` is the request timeout plus 5s."
+        refs: [430]
+
+      - id: panicking-requests-in-metrics
+        kind: informational
+        area: behavior
+        summary: "Requests whose handler panics are counted in `gombit_http_requests_total` (as 500, or the status already sent)."
+        refs: [432]
+
+      - id: embedded-html-browser-policy
+        kind: informational
+        area: security
+        summary: "Every HTML document of an embedded frontend gets the SPA browser security policy, not only the root `index.html`."
+        refs: [434]
+
+      - id: app-runs-once
+        kind: manual
+        breaking: true
+        area: api
+        summary: "A `framework.App` runs once: every return from `Run`, `RunContext` or `RunWorker` runs the stop hooks and closes what the app opened."
+        details: |
+          That includes the returns before serving (a listener that cannot
+          bind, refused worker options). Code that retried `RunContext` with
+          the same `*App` after such an error now runs against a closed cache
+          and job dispatcher: build a new `App` (`framework.New`) to retry.
+        refs: [435]
+
+      - id: trusted-proxies-trust-all
+        kind: manual
+        breaking: true
+        area: security
+        summary: "Production refuses `GOMBIT_HTTP_TRUSTED_PROXIES` values that trust every peer: a zero-length prefix in any spelling, or ranges that together cover all addresses."
+        details: |
+          `10.0.0.0/0`, `::0/0` or `0.0.0.0/1,128.0.0.0/1` used to start;
+          `Config.Validate` now refuses them in production, since trusting
+          every peer lets any client spoof its forwarded IP. List only the
+          addresses of the proxies you control.
+        refs: [500]
+        config:
+          - {var: GOMBIT_HTTP_TRUSTED_PROXIES, change: refused, environment: production}
+
+      - id: jobs-crash-redelivery-max-attempts
+        kind: informational
+        area: behavior
+        summary: "A job whose worker died mid-attempt is no longer redelivered past `MaxAttempts`: it moves to the failed jobs as exhausted."
+        details: |
+          An attempt interrupted by `Release` or worker shutdown may still run
+          once more past `MaxAttempts`, as before.
+        refs: [494]
+
+      - id: jobs-retry-all-once
+        kind: informational
+        area: cli
+        summary: "`gombit jobs retry --all` retries each failed job at most once per invocation."
+        details: |
+          A job that fails again while the command runs is left for the next
+          invocation, instead of being retried until the command times out.
+        refs: [493]
+
+      - id: database-driver-updates
+        kind: informational
+        area: dependency
+        summary: "The framework requires newer database drivers: `github.com/go-sql-driver/mysql` v1.10.1 and `github.com/mattn/go-sqlite3` v1.14.52."
+        details: |
+          Go's minimal version selection moves an app's build to them with the
+          framework upgrade. The framework also newly requires the AWS SDK
+          for Go v2 (the S3 storage driver) and `golang.org/x/sys` directly.
+        refs: [536, 540]
+
+      - id: object-storage
+        kind: informational
+        area: schema
+        summary: "Object storage (`app.Storage()`, `GOMBIT_STORAGE_*`) and storage-backed `file` / `image` model fields."
+        details: |
+          File fields record ownership in a framework table, `storage_claims`,
+          which new apps' migrations create. An existing app that adopts file
+          fields adds the table to its migrations (`claims.Models()`; see
+          docs/storage.md, "Setup").
+        schema:
+          - {model: storage/claims.Claim, table: storage_claims, change: added}
+        refs: [279, 323, 324, 325, 326, 327, 328, 329, 530]
+
+  - version: v0.7.1
+    changes:
+      - id: d10-not-found-and-panics
+        kind: informational
+        area: behavior
+        summary: "Unknown paths and recovered panics answer with the D10 error envelope (`not_found` 404, `internal` 500)."
+        details: |
+          A 404 used to be Gin's plain-text body (or empty under an embedded
+          frontend) and a panic an empty 500. A client matching those bodies
+          sees JSON now; the documented error contract was already D10, so
+          this is not marked breaking.
+        refs: [438]
+
+      - id: unencodable-response-500
+        kind: informational
+        area: behavior
+        summary: "A response that cannot be encoded as JSON is a D10 500 instead of a 200 with a plain-text body."
+        refs: [442]
+
+      - id: memory-cache-increment-overflow
+        kind: informational
+        area: behavior
+        summary: "The in-memory cache's `Increment` refuses to overflow, and a stored `nil`, as Redis does."
+        refs: [437]
+
+      - id: cache-janitor-non-positive
+        kind: informational
+        area: behavior
+        summary: "`cache.WithJanitor` with a zero or negative interval means no janitor, instead of crashing the process."
+        refs: [436]
+
+      - id: decimals-never-changed-on-write
+        kind: manual
+        breaking: true
+        area: behavior
+        summary: "A decimal is never stored changed: a value that does not fit its column's `decimal(p,s)` (or, on SQLite, has more than 15 digits) is a 422 instead of being rounded."
+        details: |
+          A decimal field whose column type is neither decimal nor text
+          (`type:real`, `type:double precision`, `type:money`, `type:bigint`)
+          now fails every write: declare it `decimal(p,s)`. A string written to
+          a text decimal column must be the canonical spelling (`"1.5"`, not
+          `"1.50"`). The generated create handler now responds with the stored
+          row: run `gombit generate` to pick that up in an existing app.
+        refs: [440]
+
+      - id: timestamps-in-storable-range
+        kind: manual
+        breaking: true
+        area: behavior
+        summary: "Every write refuses a timestamp or date no supported driver can store and return (outside 1000..9999), with a 422 on that field."
+        details: |
+          That includes a zero `time.Time` a write sets (a non-pointer field
+          left unset on create, a zero in a map or `Update`): it was stored on
+          SQLite and PostgreSQL and was a 500 on MySQL. Use a pointer for an
+          optional time. Rows that already store the zero instant stay editable
+          through `Update`, a partial `Updates` and the admin; a generic `Save`
+          of one is a 422 until the column is cleaned up (docs/database.md).
+        refs: [443]
+
+      - id: database-logging-through-app-logger
+        kind: informational
+        area: security
+        summary: "Database logging goes through the app's logger, at its level and sink, and never carries parameter values."
+        details: |
+          GORM's default logger wrote to stdout in its own format and inlined
+          parameter values into failed statements (a password hash, an
+          email). Statements and 4xx failures now log at `debug`, slow
+          statements at `warn`, other failures at `error`. A GORM logger the
+          app sets on its database is kept.
+        refs: [439]
+
+      - id: page-offset-saturates
+        kind: informational
+        area: behavior
+        summary: "A list page so far out that its offset overflows is empty, instead of returning the first page's rows."
+        refs: [441]
+
+  - version: v0.8.0
+    changes:
+      - id: dotenv-long-lines
+        kind: informational
+        area: config
+        summary: "`config.Load` reads a `.env` file whole: a line longer than 64 KiB no longer silently stops it, so the assignments after one now apply."
+        details: |
+          Before, the first line over 64 KiB ended the read without an
+          error, and every variable after it kept its process-environment
+          or default value. If a `.env` has such a line, check the values
+          set after it.
+      - id: admin-relation-string-keys
+        kind: informational
+        area: behavior
+        summary: "An admin relation field on a string key stores the string sent, byte for byte; a JSON number for it is a 422."
+        details: |
+          A numeric-looking key (`"123"`, `"007"`) was stored corrupted. A
+          client that sends a string key as a JSON number now gets a 422 on the
+          field, as for any string field: send it as a string. A uuid key must
+          be the canonical form, as a `uuid` field (no braces, with hyphens).
+          An integer key still accepts a number or its digits as a string.
+        refs: [452]
+
+      - id: admin-patch-writes-changes-only
+        kind: informational
+        area: behavior
+        summary: "An admin PATCH writes only the columns it (or a model hook) changed, never associations, and answers 404 for a row deleted meanwhile."
+        details: |
+          It used to save the whole loaded row: a concurrent change to another
+          column was reverted, a deleted row came back, and `has_many`
+          children were written back. `database.ScopeEdit` now narrows any
+          `Select("*")` update of the scoped row the same way.
+        refs: [450]
+
+      - id: floats-must-be-finite
+        kind: manual
+        breaking: true
+        area: behavior
+        summary: "Every write refuses a float that is not finite (`+Inf`, `-Inf`, `NaN`), or beyond a `float32` field's range, with a 422 on that field."
+        details: |
+          It was stored on PostgreSQL and SQLite (and a 500 on MySQL). Code
+          that stored a non-finite float on purpose in a column it never
+          returns as JSON now gets a `*database.ValidationError`: store NULL
+          (a pointer or `sql.NullFloat64`) instead. A row that already stores
+          one keeps working for partial updates of other columns and for an
+          admin edit that leaves the column alone, but a generic `Save` of it
+          is a 422 on that field until the column is set to a finite value or
+          NULL (docs/database.md § Floats).
+        refs: [449]
+
+      - id: reserved-upgrade-command
+        kind: manual
+        breaking: true
+        area: cli
+        summary: "`upgrade` is a framework command, and a reserved management-command name."
+        details: |
+          An app that registers its own `upgrade` command loses it: the
+          framework's is added first, and Cobra resolves to it. Rename the
+          app's command (and its `internal/<pkg>/commands.go` registration).
+        refs: [341]
+
+      - id: record-upgrade-baseline
+        kind: automatic
+        action: record-baseline
+        area: scaffold
+        summary: "`gombit new` records the app's upgrade baseline in a `gombit:` block of `gombit.yaml`."
+        details: |
+          An app generated before records none, and is detected as scaffold
+          version 0. `gombit upgrade baseline --write` records it.
+        refs: [341]
+
+      - id: contract-app-fork-unresolved
+        kind: manual
+        breaking: true
+        area: cli
+        summary: "`gombit contract app` refuses a framework replaced by a fork, and a `go.mod` the go command refuses."
+        details: |
+          A `replace` of `github.com/gombit-dev/gombit` by another module used
+          to report the fork's version as the framework's; it is now
+          unresolved, like a local path. A `go.mod` requiring the framework
+          twice, or replacing it twice with different targets, is an error.
+          The replace that counts is the one the go command applies to the
+          required version (an exact-version replace over an every-version
+          one; a replace of another version does not apply), so a go.mod
+          carrying several replaces can report a different version, or
+          resolve where it used to fail. Build the contract against a
+          framework release.
+        refs: [341]
+
+      - id: make-resource-windows-posix-rename
+        kind: informational
+        area: cli
+        summary: "On Windows, `gombit make resource` replaces files with a POSIX-semantics rename, so a file open with delete sharing no longer blocks it."
+        details: |
+          On a volume that refuses that rename (FAT or exFAT, a network share
+          or mapped drive, a `\\wsl$` path, or Windows before 10 1709) it keeps
+          its previous plain rename and its rollback.
+        refs: [341]
+
+      - id: text-storable-on-every-driver
+        kind: manual
+        breaking: true
+        area: behavior
+        summary: "Every write refuses text a column cannot store the same way on every driver (a NUL byte, invalid UTF-8, more than the column holds), with a 422 on that field."
+        details: |
+          It was a 500 on PostgreSQL or MySQL and stored on SQLite. A
+          `size:n` / `varchar(n)` column holds n characters, a `text` column
+          65,535 bytes (MySQL's `TEXT`), and an unsized primary-key, indexed,
+          unique or defaulted string 191 characters (MySQL's `varchar(191)`),
+          now on every driver: PostgreSQL and SQLite stored more. A row that
+          already stores such text stays editable through the admin, its form
+          included, and partial updates (`database.ScopeEdit` with
+          `database.StoredValues` judges only what an edit changes); a generic
+          `Save` of it is a 422 on that field until the value is shortened or
+          cleaned (docs/database.md § Text).
+        refs: [444]
+
+      - id: database-search-takes-context
+        kind: manual
+        breaking: true
+        area: api
+        summary: "`database.Search` takes a context and returns an error, like `FilterEq`: a search term with a NUL byte or invalid UTF-8 is a 422."
+        details: |
+          Code calling `database.Search(q, columns, term)` no longer builds:
+          call `database.Search(ctx, q, columns, term)` and return its error.
+          Run `gombit generate` to update an app's generated `handler.gen.go`,
+          which also answers a `get` of an id over `MaxInt64` with a 404.
+        refs: [444]
+
+      - id: scaffolded-get-id-over-maxint64
+        kind: manual
+        area: scaffold
+        summary: "A scaffolded `internal/product/handler.go` answers an id over `MaxInt64` with a 404; an app scaffolded before answers a 500 on PostgreSQL."
+        details: |
+          The handler is app-owned, so `gombit generate` does not update it. In
+          its `get`, parse the id with `strconv.ParseUint(input.ID, 10, 63)`
+          instead of `64`: PostgreSQL's bigint cannot bind a larger id, and no
+          row holds one. Apply the same to any hand-written handler that
+          parses a uint id.
+        refs: [444]
+
+      - id: keep-stored-zeros-deprecated
+        kind: informational
+        area: api
+        summary: "`database.KeepStoredZeros` is deprecated: use `database.ScopeEdit` with `database.StoredValues`."
+        details: |
+          `ScopeEdit` judges an edit of a loaded row on what it changes,
+          compared after the model's hooks, for the text check as well as
+          stored zero instants. `KeepStoredZeros` keeps working.
+        refs: [444]
+        deprecates: [database.KeepStoredZeros]
+
+      - id: data-exceptions-are-422
+        kind: informational
+        area: behavior
+        summary: "`MapPersistError` and `MapLoadError` answer a database data exception (a value too long or out of range for its column) with a 422 instead of a 500."
+        details: |
+          PostgreSQL 22001, 22003, 22007, 22008, 22021, 22P05 and MySQL 1264,
+          1265, 1292, 1366, 1406 (`database.IsDataException`). A uint list
+          filter over `MaxInt64` is a 422 too.
+        refs: [444]
+
+      - id: auth-session-management
+        kind: informational
+        area: api
+        summary: "Session management in both auth modes: `GET {prefix}/auth/sessions` lists the user's active sessions; `DELETE {prefix}/auth/sessions/{id}` and `DELETE {prefix}/auth/sessions?scope=others|all` revoke them."
+        details: |
+          `auth.Service` gains `ListSessions` (returning `[]auth.AuthSession`),
+          `RevokeSession`, `RevokeAllSessions` and `ErrSessionNotFound`. Cookie
+          mode clears the session cookies when a request ends its own session
+          (docs/auth.md § Sessions).
+        refs: [335]
+
+      - id: auth-session-names-reserved
+        kind: manual
+        breaking: true
+        area: api
+        summary: "With auth enabled, an app that registers the session routes, the `auth-*` session operation IDs or the `AuthSession` / `AuthRevokeResult` schema names fails at startup: the framework registers them."
+        details: |
+          With `GOMBIT_JWT_SECRET` set, registering a route at `GET` or
+          `DELETE {prefix}/auth/sessions` or `DELETE {prefix}/auth/sessions/{id}`
+          (through Huma or the raw Gin router), an operation
+          `auth-list-sessions`, `auth-revoke-session` or `auth-revoke-sessions`,
+          or a type Huma names `AuthSession`, `DataListAuthSession`,
+          `AuthRevokeResult` or `DataAuthRevokeResult` now panics when the app
+          starts. Drop the app's own session routes, which the framework's
+          replace, or rename them. A resource named `Session`
+          (`gombit make resource Session`) does not collide.
+        refs: [335]
+
+      - id: refresh-reuse-only-rotated-tokens
+        kind: informational
+        area: security
+        summary: "A refresh token revoked by logout or session revocation is a 401 that no longer revokes the user's other sessions; only an already-rotated token counts as reuse."
+        refs: [335]
+
+      - id: refresh-ttl-at-least-access-ttl
+        kind: manual
+        breaking: true
+        area: config
+        summary: "With auth enabled, a `GOMBIT_JWT_REFRESH_TTL` shorter than `GOMBIT_JWT_ACCESS_TTL` fails config validation, so the app does not start."
+        details: |
+          The refresh token's lifetime is the session's, and an access token
+          must not outlive its session: it would stop authenticating when the
+          session ends while its `exp`, `expires_in` and access cookie still
+          promised more. Config validation (`config.Load` / `Validate`) and
+          `auth.NewService` refuse that pair; equal TTLs are fine. Raise
+          `GOMBIT_JWT_REFRESH_TTL` to at least `GOMBIT_JWT_ACCESS_TTL`, or
+          lower `GOMBIT_JWT_ACCESS_TTL`. An access token also ends with its
+          session: it stops authenticating when the session expires, not only
+          when it is revoked, so a token issued before the upgrade under the
+          old TTLs stops at its session's expiry, before its `exp`.
+        config:
+          - {var: GOMBIT_JWT_REFRESH_TTL, change: refused}
+          - {var: GOMBIT_JWT_ACCESS_TTL, change: refused}
+        refs: [335]
+
+      - id: refresh-lock-failure-is-500
+        kind: informational
+        area: behavior
+        summary: "`POST /auth/refresh` answers 500, not 401, when the database fails while the rotation locks the user's row (a deadlock, a lock timeout, a lost connection)."
+        details: |
+          Only a user that no longer exists is a 401 there, so a client can
+          retry instead of treating the failure as a dead credential.
+        refs: [335]
+
+      - id: auth-user-row-lock
+        kind: informational
+        area: behavior
+        summary: "Refresh-token rotation and the session revocations lock the user's row for their transaction (`FOR NO KEY UPDATE` on PostgreSQL, `FOR UPDATE` on MySQL), so they run one at a time per user."
+        details: |
+          Application code that holds a lock on a user's row in a long
+          transaction now delays that user's refreshes and revocations. Code
+          that also writes a user's refresh tokens should lock the user's row
+          first, as the framework does.
+        refs: [335]
+
+      - id: refresh-reuse-cascade-takes-user-lock
+        kind: informational
+        area: security
+        summary: "The refresh-token reuse cascade takes the user's row lock, like rotation, so it also revokes the token a concurrent rotation of another of the user's sessions issues."
+        details: |
+          On PostgreSQL that token could survive the cascade.
+        refs: [335]
+
+      - id: client-schema-session-operations
+        kind: informational
+        area: client
+        summary: "A new app's placeholder `schema.ts` includes the session operations; an existing app's generated client gets them from `gombit client generate`."
+        refs: [335]
+
+      - id: aws-sdk-updates
+        kind: informational
+        area: dependency
+        summary: "The framework requires newer AWS SDK for Go v2 modules (the S3 storage driver): `github.com/aws/aws-sdk-go-v2` v1.47.3, `github.com/aws/aws-sdk-go-v2/service/s3` v1.114.0 and `github.com/aws/smithy-go` v1.28.5."
+        details: |
+          Go's minimal version selection moves an app's build to them with the
+          framework upgrade.
+        refs: [570, 590]
+
+  - version: unreleased
+    changes:
+      - id: bearer-handler-401-challenge
+        kind: informational
+        area: api
+        summary: "Bearer-mode session revocation errors include the `WWW-Authenticate: Bearer realm=\"api\"` challenge when the handler returns 401."
+        details: |
+          Cookie-mode 401 responses still omit a Bearer challenge.
+        refs: [604]
+
+      - id: verification-resend-rate-limit-contract
+        kind: informational
+        area: api
+        summary: "The email-verification resend operation's OpenAPI contract declares its 429 response and integer `Retry-After` header."
+        refs: [611]
+
+      - id: go-1-26-9
+        kind: informational
+        area: dependency
+        summary: "The framework requires Go 1.26.9 (`go 1.26.9` in go.mod), and `gombit new` pins it."
+        details: |
+          An app's `go` line is raised to 1.26.9 by `go get` or `go mod tidy`
+          when it moves to this release. With the default `GOTOOLCHAIN=auto`
+          the go command downloads that toolchain; with `GOTOOLCHAIN=local`,
+          or in a build image, install Go 1.26.9 or later first.
+        refs: [602]
+
+      - id: admin-integers-must-fit
+        kind: informational
+        area: behavior
+        summary: "Admin writes refuse an integer the field's Go type cannot hold, and a JSON number from 2^53 on, with a 422 on that field."
+        details: |
+          They were stored wrapped (`300` into an `int8` became `44`; `-5` into
+          a `uint` made the list endpoint a 500). A client that sends a large
+          integer sends it as a string (`"9007199254740993"`), which is read
+          exactly.
+        refs: [448]
+
+      - id: email-verification-schema
+        kind: manual
+        breaking: true
+        area: schema
+        summary: "Email verification adds `users.email_verified_at` and `users.verified_email`, and a table, `auth_one_time_tokens`, which registration and `gombit createsuperuser` write: an app migrates before it runs this release."
+        details: |
+          `auth.User` gains `EmailVerifiedAt` and `VerifiedEmail` (the
+          address the verification is for), and the new framework model
+          `auth.OneTimeToken` holds the hashed, single-use tokens the account
+          lifecycle mails. Until the database has both, registering a user and
+          `gombit createsuperuser` fail. Add `&auth.OneTimeToken{}` to the
+          app's `AutoMigrate` (`internal/platform/database.go`), then generate
+          and apply the migration (`gombit db makemigrations --model
+          github.com/gombit-dev/gombit/auth.OneTimeToken`, `gombit db
+          migrate`); `gombit upgrade --dry-run` lists the steps. Existing users
+          start unverified; mark the ones you trust by setting
+          `email_verified_at` and `verified_email` (to the user's `email`)
+          yourself.
+        schema:
+          - {model: auth.User, table: users, change: altered}
+          - {model: auth.OneTimeToken, table: auth_one_time_tokens, change: added}
+        refs: [331]
+
+      - id: email-verification-names-reserved
+        kind: manual
+        breaking: true
+        area: api
+        summary: "With auth enabled, an app that registers the email verification routes, their `auth-*` operation IDs or the `AuthVerifyEmailBody` / `AuthVerificationResult` schema names fails at startup: the framework registers them."
+        details: |
+          With `GOMBIT_JWT_SECRET` set, registering `POST
+          {prefix}/auth/verify-email` or `POST {prefix}/auth/verify-email/resend`,
+          an operation `auth-verify-email` or `auth-resend-email-verification`,
+          or a type Huma names `AuthVerifyEmailBody`, `AuthVerificationResult`
+          or `DataAuthVerificationResult` now panics when the app starts. Drop
+          the app's own verification routes, which the framework's replace, or
+          rename them.
+        refs: [331]
+
+      - id: email-verification
+        kind: informational
+        area: api
+        summary: "Email verification: registration mails a single-use, expiring link (through `framework.WithAuthMailer`), `POST {prefix}/auth/verify-email` consumes it, `POST {prefix}/auth/verify-email/resend` sends a new one, and `auth.RequireVerifiedEmail` gates an app's own operations."
+        details: |
+          A production app with no mailer sends no message (registration still
+          succeeds; a resend is a 503); development and test apps log each
+          message instead. `GET /me` and registration report `email_verified`.
+          `GOMBIT_AUTH_EMAIL_VERIFICATION_TTL` (24h) and
+          `GOMBIT_AUTH_EMAIL_VERIFICATION_URL` configure the link.
+        refs: [331]
+
+      - id: client-schema-email-verified
+        kind: informational
+        area: client
+        summary: "A new app's placeholder `schema.ts` includes the verification operations and `PublicUser.email_verified`; an existing app's generated client gets them from `gombit client generate`."
+        refs: [331]
+
+      - id: expired-rotated-refresh-token-no-cascade
+        kind: informational
+        area: security
+        summary: "An already-rotated refresh token that has expired is a 401 and no longer revokes the user's sessions."
+        refs: [458]
+
+      - id: cookie-refresh-401-clears-session-cookies
+        kind: informational
+        area: behavior
+        summary: "In cookie mode, a refresh rejected with a 401 clears the `gombit_access` and `gombit_refresh` cookies."
+        details: |
+          The OpenAPI document declares that 401 on the cookie-mode `refresh`
+          operation, with its `Set-Cookie` header and the D10 error envelope.
+        refs: [458]
+
+      - id: client-schema-cookie-refresh-401
+        kind: informational
+        area: client
+        summary: "A new cookie-mode app's placeholder `schema.ts` includes the refresh's 401 response; an existing app's generated client gets it from `gombit client generate`."
+        refs: [458]
+
+      - id: cookie-refresh-loads-user-before-commit
+        kind: informational
+        area: behavior
+        summary: "In cookie mode, a `POST /auth/refresh` that fails loading the session user rolls the token rotation back with it, instead of answering 500 after the rotation already committed."
+        refs: [606]

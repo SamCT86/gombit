@@ -76,7 +76,7 @@ func (h *Handler) list(ctx context.Context, input *listTasksInput) (*listTasksOu
 }
 
 func (h *Handler) get(ctx context.Context, input *getTaskInput) (*getTaskOutput, error) {
-	id, err := strconv.ParseUint(input.ID, 10, 64)
+	id, err := strconv.ParseUint(input.ID, 10, 63)
 	if err != nil {
 		return nil, contract.WithContext(ctx, contract.NotFound("task not found"))
 	}
@@ -97,6 +97,10 @@ func (h *Handler) create(ctx context.Context, input *createTaskInput) (*createTa
 	}
 	if err := h.DB.WithContext(ctx).Create(&row).Error; err != nil {
 		return nil, database.MapPersistError(ctx, err, "resource already exists", "create task")
+	}
+	// Respond with the stored row, as get would return it.
+	if err := h.DB.WithContext(ctx).First(&row, row.ID).Error; err != nil {
+		return nil, database.MapLoadError(ctx, err, "task not found", "reload created task")
 	}
 	return &createTaskOutput{Body: contract.Data[taskData]{Data: toTaskData(row)}}, nil
 }

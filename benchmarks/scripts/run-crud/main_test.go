@@ -65,7 +65,7 @@ func TestBenchmarkNameComesFromTheWorkloadScript(t *testing.T) {
 			t.Errorf("benchmarkName(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"", ".js", "/", "workloads/a:b.js"} {
+	for _, in := range []string{"", ".js", "/", "workloads/a:b.js", "workloads/gorm_crud.js"} {
 		if got, err := benchmarkName(in); err == nil {
 			t.Errorf("benchmarkName(%q) = %q, nil; want an error", in, got)
 		}
@@ -173,6 +173,83 @@ func TestRunReplacesOnlyItsOwnWorkload(t *testing.T) {
 	}
 }
 
+// Raw summaries are evidence for the rows, so they are keyed like the rows: a
+// second workload for the same app must write its own files and leave the first
+// workload's on disk (#370).
+func TestRunKeepsEachWorkloadsRawSummaries(t *testing.T) {
+	dir := t.TempDir()
+	cfg := runConfig{
+		targetURL: "http://unused", framework: "gombit", benchmark: "crud-list",
+		concurrency: []int{1, 10}, duration: "1s", warmup: "1s", trials: 2, outDir: dir, k6Image: "grafana/k6:0.55.0",
+	}
+	written := map[string][]string{}
+	recording := func(benchmark string) k6Runner {
+		inner := okK6(t)
+		return func(vus int, duration, summaryPath string) error {
+			if summaryPath != "" {
+				written[benchmark] = append(written[benchmark], summaryPath)
+			}
+			return inner(vus, duration, summaryPath)
+		}
+	}
+
+	if err := run(cfg, recording("crud-list")); err != nil {
+		t.Fatalf("run(crud-list): %v", err)
+	}
+	cfg.benchmark = "auth-jwt"
+	if err := run(cfg, recording("auth-jwt")); err != nil {
+		t.Fatalf("run(auth-jwt): %v", err)
+	}
+
+	perRun := len(cfg.concurrency) * cfg.trials
+	seen := map[string]string{}
+	for _, benchmark := range []string{"crud-list", "auth-jwt"} {
+		paths := written[benchmark]
+		if len(paths) != perRun {
+			t.Fatalf("%s wrote %d raw summaries, want %d: %v", benchmark, len(paths), perRun, paths)
+		}
+		for _, p := range paths {
+			if other, dup := seen[p]; dup {
+				t.Errorf("%s overwrote %s's raw summary %s", benchmark, other, p)
+			}
+			seen[p] = benchmark
+			if !strings.Contains(filepath.Base(p), "_"+benchmark+"_") {
+				t.Errorf("raw summary %s does not name its benchmark %s", p, benchmark)
+			}
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("%s raw summary missing after both runs: %v", benchmark, err)
+			}
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "raw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2*perRun {
+		t.Errorf("raw/ holds %d files, want %d (both workloads' summaries)", len(entries), 2*perRun)
+	}
+	if got, want := filepath.Base(written["crud-list"][0]), "gombit_crud-list_c1_t1.json"; got != want {
+		t.Errorf("raw summary name = %q, want %q", got, want)
+	}
+}
+
+// '_' joins framework and benchmark in raw summary names, so a framework that
+// contained it could share a file with another (framework, benchmark) key:
+// gin_gorm + crud and gin + gorm_crud. run() refuses it before writing anything.
+func TestRunRefusesAFrameworkNameContainingTheRawSeparator(t *testing.T) {
+	dir := t.TempDir()
+	cfg := runConfig{
+		targetURL: "http://unused", framework: "gin_gorm", benchmark: "crud",
+		concurrency: []int{1}, duration: "1s", warmup: "1s", trials: 1, outDir: dir, k6Image: "grafana/k6:0.55.0",
+	}
+	if err := run(cfg, okK6(t)); err == nil || !strings.Contains(err.Error(), "'_'") {
+		t.Fatalf("run(framework=gin_gorm) = %v; want a '_' refusal", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("a refused run must write nothing, found %d entries", len(entries))
+	}
+}
+
 // Without a benchmark a row can be neither merged nor attributed, so run() must
 // refuse before writing anything.
 func TestRunWithoutBenchmarkFailsAndWritesNothing(t *testing.T) {
@@ -187,6 +264,31 @@ func TestRunWithoutBenchmarkFailsAndWritesNothing(t *testing.T) {
 	for _, name := range []string{"results.json", "metadata.json"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
 			t.Errorf("%s was written despite the missing benchmark (stat err: %v)", name, err)
+		}
+	}
+}
+
+// A mistyped host class would only surface in the README banner after the
+// sweep, so it must be refused before k6 runs, with nothing written.
+func TestRunRefusesAnInvalidHostClassBeforeMeasuring(t *testing.T) {
+	t.Setenv(metadata.HostClassEnv, "Dedicated")
+	dir := t.TempDir()
+	cfg := runConfig{
+		targetURL: "http://unused", framework: "gombit", benchmark: "crud-list",
+		concurrency: []int{10}, duration: "1s", warmup: "1s", trials: 1, outDir: dir, k6Image: "grafana/k6:0.55.0",
+	}
+	measured := false
+	k6 := func(int, string, string) error { measured = true; return nil }
+	err := run(cfg, k6)
+	if err == nil || !strings.Contains(err.Error(), metadata.HostClassEnv) {
+		t.Fatalf("run() = %v, want an error naming %s", err, metadata.HostClassEnv)
+	}
+	if measured {
+		t.Error("k6 ran despite the invalid host class")
+	}
+	for _, name := range []string{"results.json", "metadata.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Errorf("%s was written despite the invalid host class (stat err: %v)", name, err)
 		}
 	}
 }
@@ -489,8 +591,8 @@ func TestRunWritesAndAccumulatesAcrossFrameworks(t *testing.T) {
 	}
 }
 
-// recordedProtocol is a canonical snapshot's protocol; reducedConfig is a run
-// that differs in every parameter run-crud records once for the whole snapshot.
+// recordedProtocol is a canonical snapshot's top-level protocol; reducedConfig
+// is a run that differs in every parameter run-crud records.
 func recordedProtocol() metadata.Metadata {
 	return metadata.Metadata{
 		Concurrency: []int{100}, Trials: 5, DurationSeconds: 30, WarmupSeconds: 10,
@@ -531,135 +633,119 @@ func snapshotBytes(t *testing.T, dir string) map[string]string {
 	return out
 }
 
-// The review's scenario: crud-list recorded at one protocol, then another
-// workload for the same app at a different one. Both row sets would survive, but
-// metadata.json's single protocol would describe crud-list with the second run's
-// parameters. The run must be refused with the snapshot byte-identical (#361).
-func TestRunRefusesAnotherWorkloadAtADifferentProtocol(t *testing.T) {
-	dir := t.TempDir()
-	seedSnapshot(t, dir, []result.Result{
-		{Framework: "gombit", Benchmark: "crud-list", Concurrency: 100, Trial: 1, Requests: 1},
-	}, recordedProtocol())
-	before := snapshotBytes(t, dir)
+// legacyUnit seeds a CRUD unit the way a snapshot written before #377 recorded
+// it: provenance only, its protocol implied by the top-level parameters.
+func legacyUnit(meta metadata.Metadata, unit string) metadata.Metadata {
+	clean := false
+	return metadata.StampUnit(meta, metadata.GroupCRUD, unit, metadata.Provenance{GitCommit: "aaaa11112222", GitDirty: &clean})
+}
 
-	err := run(reducedConfig(dir, "gombit", "auth-jwt"), okK6(t))
-	if err == nil {
-		t.Fatal("run() = nil, want a refusal: auth-jwt at 1 VU x 1 x 1s would relabel crud-list's protocol")
-	}
-	for _, want := range []string{"trials 5 -> 1", "concurrency 100 -> 1", "gombit:auth-jwt", "were not modified"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the error must say %q so the operator can act on it: %v", want, err)
-		}
-	}
-	after := snapshotBytes(t, dir)
-	for name, was := range before {
-		if after[name] != was {
-			t.Errorf("%s changed despite the refusal", name)
-		}
-	}
-	if _, statErr := os.Stat(filepath.Join(dir, "raw")); !os.IsNotExist(statErr) {
-		t.Errorf("a refused run must not measure or write raw summaries (stat err: %v)", statErr)
+// Rows are per (framework, benchmark) and so is the protocol (#377): recording
+// another workload, or another app, at different parameters is accepted, and
+// each unit keeps the protocol it was measured under. #371 refused these runs
+// because a snapshot-wide protocol could not describe both.
+func TestRunAtADifferentProtocolKeepsEachUnitsOwn(t *testing.T) {
+	for name, incoming := range map[string]struct{ framework, benchmark string }{
+		"another workload": {"gombit", "auth-jwt"},
+		"another app":      {"gin-gorm", "crud-list"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			seedSnapshot(t, dir, []result.Result{
+				{Framework: "gombit", Benchmark: "crud-list", Concurrency: 100, Trial: 1, Requests: 1},
+			}, legacyUnit(recordedProtocol(), "gombit:crud-list"))
+
+			if err := run(reducedConfig(dir, incoming.framework, incoming.benchmark), okK6(t)); err != nil {
+				t.Fatalf("run() = %v, want success: each unit records its own protocol", err)
+			}
+			if rows := readResultsJSON(t, filepath.Join(dir, "results.json")); len(rows) != 2 {
+				t.Errorf("both units' rows must be in the snapshot, got %+v", rows)
+			}
+			meta := readMetadataJSON(t, filepath.Join(dir, "metadata.json"))
+			if got, ok := meta.UnitRunParams(metadata.GroupCRUD, "gombit:crud-list"); !ok || !got.Equal(recordedProtocol().RunParams()) {
+				t.Errorf("the preserved unit must keep the protocol it was measured under, got %+v, %v", got, ok)
+			}
+			unit := result.ProvenanceUnit(incoming.framework, incoming.benchmark)
+			want := reducedConfig(dir, incoming.framework, incoming.benchmark).runParams()
+			if got, ok := meta.UnitRunParams(metadata.GroupCRUD, unit); !ok || !got.Equal(want) {
+				t.Errorf("%s must record the protocol it ran, got %+v, %v", unit, got, ok)
+			}
+		})
 	}
 }
 
-// The control for the test above: the same second workload under the SAME
-// parameters is exactly what #361 exists to allow, so the guard must not stop it.
-func TestRunAllowsAnotherWorkloadUnderTheRecordedProtocol(t *testing.T) {
-	dir := t.TempDir()
-	seedSnapshot(t, dir, []result.Result{
-		{Framework: "gombit", Benchmark: "crud-list", Concurrency: 1, Trial: 1, Requests: 1},
-	}, metadata.Metadata{
-		Concurrency: []int{1}, Trials: 1, DurationSeconds: 1, WarmupSeconds: 1,
-		BenchmarkTool: "grafana/k6:0.55.0",
-	})
-
-	if err := run(reducedConfig(dir, "gombit", "auth-jwt"), okK6(t)); err != nil {
-		t.Fatalf("run() = %v, want success: identical parameters describe every row honestly", err)
-	}
-	var units []string
-	for _, r := range readResultsJSON(t, filepath.Join(dir, "results.json")) {
-		units = append(units, r.ProvenanceUnit())
-	}
-	if len(units) != 2 {
-		t.Errorf("both workloads must be in the snapshot, got %v", units)
-	}
-}
-
-// The framework axis had the same gap before workloads existed:
-// `APPS=gombit make benchmark-crud-all TRIALS=1 DURATION=1s` over a full
-// snapshot kept the other apps' rows and rewrote the protocol they describe.
-func TestRunRefusesAnotherFrameworkAtADifferentProtocol(t *testing.T) {
-	dir := t.TempDir()
-	seedSnapshot(t, dir, []result.Result{
-		{Framework: "gin-gorm", Benchmark: "crud-list", Concurrency: 100, Trial: 1, Requests: 1},
-	}, recordedProtocol())
-	before := snapshotBytes(t, dir)
-
-	if err := run(reducedConfig(dir, "gombit", "crud-list"), okK6(t)); err == nil {
-		t.Fatal("run() = nil, want a refusal: gin-gorm's rows would be reported at gombit's protocol")
-	}
-	for name, was := range snapshotBytes(t, dir) {
-		if before[name] != was {
-			t.Errorf("%s changed despite the refusal", name)
-		}
-	}
-}
-
-// A run that replaces every row in the snapshot leaves nothing for the new
-// parameters to misdescribe, so re-measuring at a new protocol stays possible.
-func TestRunMayChangeTheProtocolWhenItReplacesEveryRow(t *testing.T) {
-	dir := t.TempDir()
-	seedSnapshot(t, dir, []result.Result{
-		{Framework: "gombit", Benchmark: "crud-list", Concurrency: 100, Trial: 1, Requests: 1},
-	}, recordedProtocol())
-
-	if err := run(reducedConfig(dir, "gombit", "crud-list"), okK6(t)); err != nil {
-		t.Fatalf("run() = %v, want success: nothing would survive to be misdescribed", err)
-	}
-	if got := readMetadataJSON(t, filepath.Join(dir, "metadata.json")); got.Trials != 1 {
-		t.Errorf("the new protocol must be recorded, trials = %d", got.Trials)
-	}
-}
-
-// The pre-flight check sees the snapshot as it stood before the sweep. Another
-// producer that runs to completion while this run is measuring (hours, for the
-// canonical sweep) can rewrite it, so writeOutputs checks the snapshot it then
-// merges into. This is a sequential rewrite during the sweep, not a write that
-// overlaps writeOutputs itself: producers do not lock OUT_DIR, and running two
-// at once against one directory is unsupported.
-func TestWriteRecheckCatchesASnapshotRewrittenDuringTheSweep(t *testing.T) {
+// A second workload under the same parameters is what #361 exists to allow:
+// both units end up recorded at that protocol.
+func TestRunAddsAnotherWorkloadUnderTheSameProtocol(t *testing.T) {
 	dir := t.TempDir()
 	cfg := reducedConfig(dir, "gombit", "auth-jwt")
-	compatible := metadata.Metadata{
-		Concurrency: []int{1}, Trials: 1, DurationSeconds: 1, WarmupSeconds: 1,
-		BenchmarkTool: "grafana/k6:0.55.0",
-	}
 	seedSnapshot(t, dir, []result.Result{
 		{Framework: "gombit", Benchmark: "crud-list", Concurrency: 1, Trial: 1, Requests: 1},
-	}, compatible)
+	}, legacyUnit(metadata.Metadata{}.WithRunParams(cfg.runParams()), "gombit:crud-list"))
+
+	if err := run(cfg, okK6(t)); err != nil {
+		t.Fatalf("run() = %v", err)
+	}
+	if rows := readResultsJSON(t, filepath.Join(dir, "results.json")); len(rows) != 2 {
+		t.Errorf("both workloads must be in the snapshot, got %+v", rows)
+	}
+	meta := readMetadataJSON(t, filepath.Join(dir, "metadata.json"))
+	for _, unit := range []string{"gombit:crud-list", "gombit:auth-jwt"} {
+		if got, ok := meta.UnitRunParams(metadata.GroupCRUD, unit); !ok || !got.Equal(cfg.runParams()) {
+			t.Errorf("%s must be recorded at the shared protocol, got %+v, %v", unit, got, ok)
+		}
+	}
+}
+
+// Re-measuring a unit at a new protocol replaces its protocol with its rows.
+func TestRunReplacesItsOwnUnitsProtocol(t *testing.T) {
+	dir := t.TempDir()
+	seedSnapshot(t, dir, []result.Result{
+		{Framework: "gombit", Benchmark: "crud-list", Concurrency: 100, Trial: 1, Requests: 1},
+	}, legacyUnit(recordedProtocol(), "gombit:crud-list"))
+
+	if err := run(reducedConfig(dir, "gombit", "crud-list"), okK6(t)); err != nil {
+		t.Fatalf("run() = %v", err)
+	}
+	meta := readMetadataJSON(t, filepath.Join(dir, "metadata.json"))
+	if got, ok := meta.UnitRunParams(metadata.GroupCRUD, "gombit:crud-list"); !ok || got.Trials != 1 {
+		t.Errorf("the re-measured unit must record its new protocol, got %+v, %v", got, ok)
+	}
+}
+
+// Another producer that runs to completion while this run is measuring (hours,
+// for the canonical sweep) rewrites the snapshot. writeOutputs merges into what
+// is on disk then, so that producer's rows and protocol survive alongside this
+// run's. This is a sequential rewrite during the sweep, not a write that
+// overlaps writeOutputs itself: producers do not lock OUT_DIR, and running two
+// at once against one directory is unsupported.
+func TestASnapshotRewrittenDuringTheSweepKeepsItsUnitsProtocol(t *testing.T) {
+	dir := t.TempDir()
+	cfg := reducedConfig(dir, "gombit", "auth-jwt")
 
 	inner := okK6(t)
 	rewritten := false
 	k6run := func(vus int, duration, summaryPath string) error {
 		if summaryPath != "" && !rewritten {
-			// Another producer, finishing while this run measures, records a
-			// different protocol.
 			seedSnapshot(t, dir, []result.Result{
 				{Framework: "gombit", Benchmark: "crud-list", Concurrency: 100, Trial: 1, Requests: 1},
-			}, recordedProtocol())
+			}, legacyUnit(recordedProtocol(), "gombit:crud-list"))
 			rewritten = true
 		}
 		return inner(vus, duration, summaryPath)
 	}
-	if err := run(cfg, k6run); err == nil {
-		t.Fatal("run() = nil, want the write-time check to refuse a snapshot rewritten during the sweep")
+	if err := run(cfg, k6run); err != nil {
+		t.Fatalf("run() = %v", err)
 	}
-	rows := readResultsJSON(t, filepath.Join(dir, "results.json"))
-	if len(rows) != 1 || rows[0].Benchmark != "crud-list" {
-		t.Errorf("results.json must keep only the other producer's row, got %+v", rows)
+	if rows := readResultsJSON(t, filepath.Join(dir, "results.json")); len(rows) != 2 {
+		t.Errorf("both producers' rows must survive, got %+v", rows)
 	}
-	if got := readMetadataJSON(t, filepath.Join(dir, "metadata.json")); got.Trials != 5 {
-		t.Errorf("metadata.json must keep the other producer's protocol, trials = %d", got.Trials)
+	meta := readMetadataJSON(t, filepath.Join(dir, "metadata.json"))
+	if got, ok := meta.UnitRunParams(metadata.GroupCRUD, "gombit:crud-list"); !ok || got.Trials != 5 {
+		t.Errorf("the other producer's unit must keep its protocol, got %+v, %v", got, ok)
+	}
+	if got, ok := meta.UnitRunParams(metadata.GroupCRUD, "gombit:auth-jwt"); !ok || got.Trials != 1 {
+		t.Errorf("this run's unit must record its own protocol, got %+v, %v", got, ok)
 	}
 }
 
@@ -696,8 +782,9 @@ func TestZeroTrialRunCannotRewriteThePreservedRowsProtocol(t *testing.T) {
 	}
 }
 
-// Incoming parameters must be complete and valid: Merge writes every one of
-// them, so none may be a flag left at zero or a string that failed to parse.
+// Incoming parameters must be complete and valid: they are recorded whole as
+// the unit's protocol, so none may be a flag left at zero or a string that
+// failed to parse.
 func TestRunRejectsIncompleteOrInvalidRunParameters(t *testing.T) {
 	for name, mutate := range map[string]func(*runConfig){
 		"zero trials":        func(c *runConfig) { c.trials = 0 },
@@ -728,32 +815,22 @@ func TestRunRejectsIncompleteOrInvalidRunParameters(t *testing.T) {
 	}
 }
 
-// A zero-second warm-up is a legitimate choice, so it is a value, not a
-// wildcard: it matches a snapshot recorded with no warm-up and conflicts with one
-// recorded with a warm-up.
-func TestZeroWarmupIsComparedAsAValue(t *testing.T) {
-	other := []result.Result{{Framework: "gin-gorm", Benchmark: "crud-list", Concurrency: 1, Trial: 1, Requests: 1}}
-	recorded := func(warmup float64) metadata.Metadata {
-		return metadata.Metadata{
-			Concurrency: []int{1}, Trials: 1, DurationSeconds: 1, WarmupSeconds: warmup,
-			BenchmarkTool: "grafana/k6:0.55.0",
-		}
-	}
-
+// A zero-second warm-up is a legitimate choice, so it is recorded as a value on
+// the unit that ran it, and does not move another unit's recorded warm-up.
+func TestZeroWarmupIsRecordedAsAValue(t *testing.T) {
 	dir := t.TempDir()
-	seedSnapshot(t, dir, other, recorded(10))
+	seedSnapshot(t, dir, []result.Result{{Framework: "gin-gorm", Benchmark: "crud-list", Concurrency: 100, Trial: 1, Requests: 1}},
+		legacyUnit(recordedProtocol(), "gin-gorm:crud-list"))
 	cfg := reducedConfig(dir, "gombit", "crud-list")
 	cfg.warmup = "0s"
-	err := run(cfg, okK6(t))
-	if err == nil || !strings.Contains(err.Error(), "warm-up 10s -> 0s") {
-		t.Errorf("dropping the warm-up under preserved rows must be refused, got %v", err)
-	}
-
-	dir = t.TempDir()
-	seedSnapshot(t, dir, other, recorded(0))
-	cfg = reducedConfig(dir, "gombit", "crud-list")
-	cfg.warmup = "0s"
 	if err := run(cfg, okK6(t)); err != nil {
-		t.Errorf("a zero warm-up must match a snapshot recorded with none, got %v", err)
+		t.Fatalf("run() = %v", err)
+	}
+	meta := readMetadataJSON(t, filepath.Join(dir, "metadata.json"))
+	if got, ok := meta.UnitRunParams(metadata.GroupCRUD, "gombit:crud-list"); !ok || got.WarmupSeconds != 0 || got.Trials != 1 {
+		t.Errorf("a zero warm-up must be recorded as the unit's value, got %+v, %v", got, ok)
+	}
+	if got, ok := meta.UnitRunParams(metadata.GroupCRUD, "gin-gorm:crud-list"); !ok || got.WarmupSeconds != 10 {
+		t.Errorf("another unit's warm-up must not move, got %+v, %v", got, ok)
 	}
 }

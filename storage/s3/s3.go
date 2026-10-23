@@ -50,6 +50,9 @@
 // s3:ListBucket on the bucket (arn:aws:s3:::BUCKET). Without ListBucket, S3
 // answers a request for a missing object with 403 Access Denied rather than
 // 404, and the driver cannot tell a missing object from a denied one.
+// s3:ListMultipartUploadParts on the objects is optional: Fence uses it to
+// free parts stored after an abort, and without it leaves them to a
+// lifecycle rule (the fence itself needs only AbortMultipartUpload).
 //
 // S3 carries user metadata as ASCII HTTP headers. A value that is not
 // printable ASCII is sent RFC 2047 encoded (mime.BEncoding), as S3
@@ -60,6 +63,7 @@ package s3
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -116,6 +120,9 @@ type Config struct {
 	// bucket's own address. Empty: URL answers storage.ErrUnsupported for a
 	// public URL (signed URLs still work).
 	PublicURL string
+	// Warn, when set, is told about failures that fail no operation, such
+	// as parts Fence could not free after the upload was already fenced.
+	Warn func(msg string, err error)
 }
 
 // String describes the store without its credentials.
@@ -138,6 +145,7 @@ type Store struct {
 	prefix    string
 	public    string // PublicPrefix
 	publicURL string
+	warn      func(msg string, err error)
 	// bucketState is what a HEAD request's 404 needs: it does not say
 	// whether the object or the bucket is missing (see checkBucket).
 	bucketState bucketCheck
@@ -306,6 +314,7 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		prefix:    cfg.Prefix,
 		public:    cfg.PublicPrefix,
 		publicURL: cfg.PublicURL,
+		warn:      cfg.Warn,
 	}, nil
 }
 
@@ -646,6 +655,334 @@ func (s *Store) Stat(ctx context.Context, key string) (storage.ObjectInfo, error
 	return info, storage.Wrap("stat", key, err)
 }
 
+var _ storage.Publisher = (*Store)(nil)
+
+// Copy parts: at most maxCopyPart bytes each (S3's limit for one
+// UploadPartCopy), copyPartSize by default, and at most maxCopyParts of
+// them, which covers S3's largest object (5 TiB). ETags are opaque, so the
+// publication token's size is not assumed from the part count: it is
+// checked as each ETag arrives (preparePublish).
+const (
+	maxCopyPart  = 5 << 30
+	copyPartSize = 1 << 30
+	maxCopyParts = 1100 // 1100 parts of 5 GiB cover 5 TiB
+)
+
+// publication is a prepared copy: the multipart upload of Key (the
+// storage key) that Publish completes and Fence aborts, the ETag of each
+// part as S3 returned it when the part was uploaded (the manifest
+// CompleteMultipartUpload is sent; AWS forbids building it from a
+// listing), and the object it will publish.
+// A cleanup token (Cleanup) names only the key and upload ID: a prepared
+// upload that can be fenced but not published, returned when preparing
+// fails with something left to abort.
+type publication struct {
+	Key         string            `json:"k"`
+	UploadID    string            `json:"u"`
+	Cleanup     bool              `json:"c,omitempty"`
+	ETags       []string          `json:"e"`
+	Size        int64             `json:"s"`
+	ContentType string            `json:"t"`
+	Metadata    map[string]string `json:"m,omitempty"`
+}
+
+// cleanupToken is p's cleanup token: its key and upload ID only.
+func (p publication) cleanupToken() (string, error) {
+	return publication{Key: p.Key, UploadID: p.UploadID, Cleanup: true}.token()
+}
+
+func (p publication) token() (string, error) {
+	b, err := json.Marshal(p)
+	if err == nil && len(b) > storage.MaxPublicationToken {
+		err = fmt.Errorf("s3 storage: a %d-byte publication token, more than %d", len(b), storage.MaxPublicationToken)
+	}
+	return string(b), err
+}
+
+func parsePublication(token string) (publication, error) {
+	var p publication
+	if err := json.Unmarshal([]byte(token), &p); err != nil || p.Key == "" || p.UploadID == "" {
+		return publication{}, fmt.Errorf("%w: a malformed publication token", storage.ErrInvalidOptions)
+	}
+	return p, nil
+}
+
+// copyParts returns the part size a copy of size bytes uses: none (one
+// whole-object part) up to maxCopyPart, else copyPartSize, grown to stay
+// within maxCopyParts.
+func copyParts(size int64) (int64, error) {
+	if size <= maxCopyPart {
+		return 0, nil
+	}
+	part := max(int64(copyPartSize), (size+maxCopyParts-1)/maxCopyParts)
+	if part > maxCopyPart {
+		return 0, fmt.Errorf("s3 storage: a %d-byte object is larger than %d parts of %d bytes", size, maxCopyParts, maxCopyPart)
+	}
+	return part, nil
+}
+
+// PreparePublish implements storage.Publisher: it creates a multipart
+// upload of dst with src's content type and metadata, and copies src into
+// its parts server-side (UploadPartCopy; the bytes stay in S3), keeping
+// each part's ETag for the token. Nothing is published until Publish
+// completes the upload. The token never exceeds
+// storage.MaxPublicationToken: its size is checked as each (opaque) ETag
+// arrives, and preparing fails as soon as the next would not fit. If
+// preparing fails, the upload is aborted; if a part request went
+// unanswered (S3 may still store the part after the abort) or the abort
+// failed, the error is returned with a cleanup token (the key and upload
+// ID only, checked to fit before any part is copied), for the caller to
+// record and Fence.
+func (s *Store) PreparePublish(ctx context.Context, src, dst string) (string, error) {
+	token, err := s.preparePublish(ctx, src, dst)
+	return token, storage.Wrap("publish", dst, err)
+}
+
+func (s *Store) preparePublish(ctx context.Context, src, dst string) (string, error) {
+	srcKey, err := s.objectKey(src)
+	if err != nil {
+		return "", err
+	}
+	dstKey, err := s.objectKey(dst)
+	if err != nil {
+		return "", err
+	}
+	info, err := s.Stat(ctx, src)
+	if err != nil {
+		return "", err
+	}
+	partSize, err := copyParts(info.Size)
+	if err != nil {
+		return "", err
+	}
+	created, err := s.client.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(dstKey),
+		ContentType: aws.String(info.ContentType),
+		Metadata:    encodeMetadata(info.Metadata),
+	})
+	if err != nil {
+		return "", classify(ctx, err)
+	}
+	p := publication{Key: dst, UploadID: aws.ToString(created.UploadId), ETags: []string{}, Size: info.Size, ContentType: info.ContentType, Metadata: info.Metadata}
+	// The cleanup token is what a failure returns: it must fit before
+	// anything is copied, so that a prepared upload is always recordable.
+	cleanup, cerr := p.cleanupToken()
+	fail := func(err error, inFlight bool) (string, error) {
+		// Nothing was published (only Publish completes the upload): abort
+		// it. If that proves nothing is left, no token is needed.
+		err = classifyPut(ctx, s.settle(ctx, dstKey, p.UploadID, err, inFlight), false)
+		var abort *AbortError
+		if !errors.As(err, &abort) {
+			return "", err
+		}
+		if cerr != nil {
+			// Unrecordable (an upload ID too long to fit any token): the
+			// error says what was left; a lifecycle rule aborting
+			// incomplete multipart uploads is the only backstop.
+			return "", errors.Join(err, cerr)
+		}
+		return cleanup, err
+	}
+	if cerr != nil {
+		return fail(cerr, false)
+	}
+	// used is the token's size so far; each ETag adds its JSON encoding and
+	// a comma.
+	base, err := json.Marshal(p)
+	if err != nil {
+		return fail(err, false)
+	}
+	used := len(base)
+	addETag := func(etag string, number int32) error {
+		enc, err := json.Marshal(etag)
+		if err != nil {
+			return err
+		}
+		if used+len(enc)+1 > storage.MaxPublicationToken {
+			return fmt.Errorf("s3 storage: part %d's ETag would make the publication token larger than %d bytes", number, storage.MaxPublicationToken)
+		}
+		used += len(enc) + 1
+		p.ETags = append(p.ETags, etag)
+		return nil
+	}
+	if info.Size == 0 {
+		// UploadPartCopy copies at least a byte; an empty object is one
+		// empty part.
+		partCtx, sent := counting(ctx)
+		out, err := s.client.UploadPart(partCtx, &awss3.UploadPartInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(dstKey), UploadId: created.UploadId,
+			PartNumber: aws.Int32(1), Body: bytes.NewReader(nil), ContentLength: aws.Int64(0),
+		})
+		if err != nil {
+			return fail(err, sent.unanswered())
+		}
+		if err := addETag(aws.ToString(out.ETag), 1); err != nil {
+			return fail(err, false)
+		}
+	}
+	source := copySource(s.bucket, srcKey)
+	for number, start := int32(1), int64(0); start < info.Size; number++ {
+		in := &awss3.UploadPartCopyInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(dstKey), UploadId: created.UploadId,
+			PartNumber: aws.Int32(number), CopySource: aws.String(source),
+		}
+		end := info.Size
+		if partSize > 0 {
+			end = min(start+partSize, info.Size)
+			in.CopySourceRange = aws.String(fmt.Sprintf("bytes=%d-%d", start, end-1))
+		}
+		partCtx, sent := counting(ctx)
+		out, err := s.client.UploadPartCopy(partCtx, in)
+		if err != nil {
+			return fail(err, sent.unanswered())
+		}
+		if out.CopyPartResult == nil || aws.ToString(out.CopyPartResult.ETag) == "" {
+			return fail(fmt.Errorf("s3 storage: UploadPartCopy answered no ETag for part %d", number), false)
+		}
+		if err := addETag(aws.ToString(out.CopyPartResult.ETag), number); err != nil {
+			return fail(err, false)
+		}
+		start = end
+	}
+	token, err := p.token()
+	if err != nil {
+		return fail(err, false) // cannot happen: the size was checked part by part
+	}
+	return token, nil
+}
+
+// copySource is CopySource for objKey in bucket: each segment escaped.
+func copySource(bucket, objKey string) string {
+	segments := strings.Split(objKey, "/")
+	for i, seg := range segments {
+		segments[i] = url.PathEscape(seg)
+	}
+	return url.PathEscape(bucket) + "/" + strings.Join(segments, "/")
+}
+
+// Publish implements storage.Publisher: it completes the prepared upload,
+// once (a request sent without a definite answer is
+// storage.ErrUnknownOutcome, which Fence settles), with
+// "If-None-Match: *" where S3 honors it.
+func (s *Store) Publish(ctx context.Context, token string) (storage.ObjectInfo, error) {
+	p, err := parsePublication(token)
+	if err != nil {
+		return storage.ObjectInfo{}, storage.Wrap("publish", "", err)
+	}
+	info, err := s.publish(ctx, p)
+	return info, storage.Wrap("publish", p.Key, err)
+}
+
+func (s *Store) publish(ctx context.Context, p publication) (storage.ObjectInfo, error) {
+	objKey, err := s.objectKey(p.Key)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	if p.Cleanup {
+		return storage.ObjectInfo{}, fmt.Errorf("%w: a cleanup token can be fenced, not published", storage.ErrInvalidOptions)
+	}
+	// The manifest is the parts as S3 acknowledged them when they were
+	// uploaded, recorded in the token.
+	parts := make([]types.CompletedPart, len(p.ETags))
+	for i, etag := range p.ETags {
+		parts[i] = types.CompletedPart{ETag: aws.String(etag), PartNumber: aws.Int32(int32(i + 1))}
+	}
+	if len(parts) == 0 {
+		return storage.ObjectInfo{}, fmt.Errorf("%w: a publication token without parts", storage.ErrInvalidOptions)
+	}
+	if err := ctx.Err(); err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	callCtx, sent := counting(ctx)
+	done, err := s.client.CompleteMultipartUpload(callCtx, &awss3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(s.bucket),
+		Key:             aws.String(objKey),
+		UploadId:        aws.String(p.UploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+		IfNoneMatch:     aws.String("*"),
+	}, singleAttempt)
+	if err != nil {
+		return storage.ObjectInfo{}, classifyPut(ctx, publishFailed(err, sent), true)
+	}
+	return storage.ObjectInfo{
+		Key:         p.Key,
+		Size:        p.Size,
+		ContentType: p.ContentType,
+		ETag:        strings.Trim(aws.ToString(done.ETag), `"`),
+		Metadata:    cloneOrNil(p.Metadata),
+	}, nil
+}
+
+// fenceRounds is how many times Fence aborts an upload whose parts are
+// still listed after an abort.
+const fenceRounds = 3
+
+// Fence implements storage.Publisher with AbortMultipartUpload. S3 orders
+// an abort and a Complete of one upload: an abort that succeeds proves the
+// upload never completed and never will; NoSuchUpload means it is over
+// already (completed, or aborted before). Either way nothing more can be
+// published: that, the first abort's result, is what nil proves, and an
+// abort that fails otherwise proves nothing and is returned.
+//
+// The rest only frees storage, never a reason to fail the fence: a part
+// request still being processed may store its part after the abort, so, as
+// AWS advises, Fence lists the upload's parts (s3:ListMultipartUploadParts,
+// optional) and aborts again while any are listed. A failure there is told
+// to Config.Warn. A listing is a snapshot, and a part can still land after
+// Fence returns; such a part is never an object (it cannot be read or
+// published), and a bucket lifecycle rule aborting incomplete multipart
+// uploads reclaims it.
+func (s *Store) Fence(ctx context.Context, token string) error {
+	p, err := parsePublication(token)
+	if err != nil {
+		return storage.Wrap("fence", "", err)
+	}
+	objKey, err := s.objectKey(p.Key)
+	if err != nil {
+		return storage.Wrap("fence", p.Key, err)
+	}
+	abort := func() error {
+		_, err := s.client.AbortMultipartUpload(ctx, &awss3.AbortMultipartUploadInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(objKey), UploadId: aws.String(p.UploadID),
+		})
+		if err != nil && !isNoSuchUpload(err) {
+			return classify(ctx, err)
+		}
+		return nil
+	}
+	if err := abort(); err != nil {
+		return storage.Wrap("fence", p.Key, err) // nothing proven
+	}
+	// Fenced. From here on, freeing parts stored after the abort.
+	for range fenceRounds {
+		out, err := s.client.ListParts(ctx, &awss3.ListPartsInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(objKey), UploadId: aws.String(p.UploadID),
+		})
+		switch {
+		case isNoSuchUpload(err), err == nil && len(out.Parts) == 0:
+			return nil
+		case err != nil:
+			s.warnf("s3 storage: an upload was fenced, but its parts could not be listed to free them (a lifecycle rule aborting incomplete multipart uploads reclaims them)", storage.Wrap("fence", p.Key, classify(ctx, err)))
+			return nil
+		}
+		if err := abort(); err != nil {
+			s.warnf("s3 storage: an upload was fenced, but parts stored after the abort could not be freed (a lifecycle rule reclaims them)", storage.Wrap("fence", p.Key, err))
+			return nil
+		}
+	}
+	s.warnf("s3 storage: an upload was fenced, but parts remain after repeated aborts (a lifecycle rule reclaims them)",
+		storage.Wrap("fence", p.Key, fmt.Errorf("upload %s", p.UploadID)))
+	return nil
+}
+
+// warnf tells Config.Warn about msg and err, if it is set.
+func (s *Store) warnf(msg string, err error) {
+	if s.warn != nil {
+		s.warn(msg, err)
+	}
+}
+
 // Delete implements storage.Storage. S3 deletes are idempotent: deleting a
 // missing object succeeds.
 func (s *Store) Delete(ctx context.Context, key string) error {
@@ -718,6 +1055,43 @@ func (s *Store) URL(ctx context.Context, key string, opts storage.URLOptions) (s
 		return "", storage.Wrap("url", key, classify(ctx, err))
 	}
 	return req.URL, nil
+}
+
+var _ storage.Lister = (*Store)(nil)
+
+// List implements storage.Lister with ListObjectsV2, in key order, a page
+// (up to 1000 objects) at a time. ContentType and Metadata are empty: a
+// listing does not carry them. Objects under the store's prefix whose keys
+// are not valid storage keys (written by something else) are skipped.
+func (s *Store) List(ctx context.Context, prefix string, fn func(storage.ObjectInfo) error) error {
+	if err := ctx.Err(); err != nil {
+		return storage.Wrap("list", prefix, err)
+	}
+	pages := awss3.NewListObjectsV2Paginator(s.client, &awss3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(s.prefix + prefix),
+	})
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return storage.Wrap("list", prefix, classify(ctx, err))
+		}
+		for _, o := range page.Contents {
+			key, ok := strings.CutPrefix(aws.ToString(o.Key), s.prefix)
+			if !ok || storage.ValidateKey(key) != nil {
+				continue
+			}
+			if err := fn(storage.ObjectInfo{
+				Key:     key,
+				Size:    aws.ToInt64(o.Size),
+				ETag:    strings.Trim(aws.ToString(o.ETag), `"`),
+				ModTime: aws.ToTime(o.LastModified),
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 var _ storage.DirectUploader = (*Store)(nil)

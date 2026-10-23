@@ -81,11 +81,9 @@ func (h *handlers) listResources(ctx context.Context, input *listInput) (*listOu
 	page, perPage := contract.ClampPage(input.Page, input.PerPage)
 
 	q := db.WithContext(ctx).Model(m.newInstance())
-	q, err = applySearch(q, m, input.Search)
+	q, err = applySearch(ctx, q, m, input.Search)
 	if err != nil {
-		return nil, contract.WithContext(ctx, contract.Validation("The request contains invalid fields.", map[string][]string{
-			"search": {err.Error()},
-		}))
+		return nil, err
 	}
 	q, err = applyFilters(ctx, q, m, queryValues(ctx))
 	if err != nil {
@@ -113,6 +111,9 @@ func (h *handlers) listResources(ctx context.Context, input *listInput) (*listOu
 	m.forEach(slice, func(item any) {
 		rows = append(rows, m.toRow(item))
 	})
+	if err := h.resolveRows(ctx, m, rows); err != nil {
+		return nil, err
+	}
 	return &listOutput{
 		Body: contract.DataMeta[[]row, contract.PageMeta]{
 			Data: rows,
@@ -143,10 +144,24 @@ func (h *handlers) createResource(ctx context.Context, input *writeInput) (*rowO
 	if err := applyWrite(ctx, m, inst, body, true); err != nil {
 		return nil, err
 	}
-	if err := persistWithM2M(ctx, db, m, inst, m2mIDs, true); err != nil {
+	cl := h.fileClaims(db)
+	if err := h.acceptFiles(ctx, cl, m, inst, nil); err != nil {
 		return nil, err
 	}
-	return &rowOutput{Body: contract.Data[row]{Data: rowWithM2M(m, inst, m2mIDs)}}, nil
+	if err := h.writeFiles(ctx, cl, db, m, nil, inst, func(tx *gorm.DB) error {
+		return persistWithM2M(ctx, tx, m, inst, m2mIDs, true, nil, nil)
+	}); err != nil {
+		return nil, err
+	}
+	return h.respond(ctx, m, rowWithM2M(m, inst, m2mIDs))
+}
+
+// respond is a single-row response, with its files resolved.
+func (h *handlers) respond(ctx context.Context, m *registered, r row) (*rowOutput, error) {
+	if err := h.resolveFiles(ctx, m, r); err != nil {
+		return nil, err
+	}
+	return &rowOutput{Body: contract.Data[row]{Data: r}}, nil
 }
 
 func (h *handlers) getResource(ctx context.Context, input *itemInput) (*rowOutput, error) {
@@ -163,7 +178,7 @@ func (h *handlers) getResource(ctx context.Context, input *itemInput) (*rowOutpu
 	if err != nil {
 		return nil, err
 	}
-	return &rowOutput{Body: contract.Data[row]{Data: m.toRow(inst)}}, nil
+	return h.respond(ctx, m, m.toRow(inst))
 }
 
 func (h *handlers) updateResource(ctx context.Context, input *patchInput) (*rowOutput, error) {
@@ -190,17 +205,36 @@ func (h *handlers) updateResource(ctx context.Context, input *patchInput) (*rowO
 	if m.version != nil {
 		return h.updateVersioned(ctx, m, inst, input, db)
 	}
+	before := m.fileKeys(inst)
 	m2mIDs, body, err := splitM2M(ctx, m, input.Body)
 	if err != nil {
 		return nil, err
 	}
+	// What the row stores before the PATCH: the write checks judge only the
+	// columns the PATCH (or a model hook) changes, so a row holding a value
+	// stored before a check (a zero instant, over-long text) stays editable,
+	// whatever fields the form sends back unchanged (issues #443, #444).
+	stored := database.StoredValues(db, inst)
 	if err := applyWrite(ctx, m, inst, body, false); err != nil {
 		return nil, err
 	}
-	if err := persistWithM2M(ctx, db, m, inst, m2mIDs, false); err != nil {
+	cl := h.fileClaims(db)
+	if err := h.acceptFiles(ctx, cl, m, inst, before); err != nil {
 		return nil, err
 	}
-	return &rowOutput{Body: contract.Data[row]{Data: rowWithM2M(m, inst, m2mIDs)}}, nil
+	if err := h.writeFiles(ctx, cl, db, m, before, inst, func(tx *gorm.DB) error {
+		return persistWithM2M(ctx, database.ScopeEdit(tx, inst, stored), m, inst, m2mIDs, false, m.updateOmits(before, inst), m.fileFence(before))
+	}); err != nil {
+		return nil, err
+	}
+	// The PATCH wrote the columns it changed; the row may hold another
+	// request's change to the rest, so the response is the row as read back
+	// after the write (a delete landing in between makes it a 404).
+	fresh, err := h.loadByID(ctx, m, input.ID)
+	if err != nil {
+		return nil, err
+	}
+	return h.respond(ctx, m, rowWithM2M(m, fresh, m2mIDs))
 }
 
 // updateVersioned performs an optimistic-locking update for a model that carries
@@ -211,6 +245,7 @@ func (h *handlers) updateResource(ctx context.Context, input *patchInput) (*rowO
 // loser matches zero rows and gets a 409 instead of a silent last-write-wins.
 func (h *handlers) updateVersioned(ctx context.Context, m *registered, inst any, input *patchInput, db *gorm.DB) (*rowOutput, error) {
 	expected := m.version.get(inst)
+	before := m.fileKeys(inst)
 	body := input.Body
 	if raw, ok := body[m.version.name]; ok {
 		cv, err := asInt64(raw)
@@ -223,23 +258,49 @@ func (h *handlers) updateVersioned(ctx context.Context, m *registered, inst any,
 		expected = cv
 		body = withoutKey(body, m.version.name)
 	}
+	// What the row stores before the PATCH: the write checks judge only the
+	// columns the PATCH (or a model hook) changes, so a row holding a value
+	// stored before a check (a zero instant, over-long text) stays editable,
+	// whatever fields the form sends back unchanged (issues #443, #444).
+	stored := database.StoredValues(db, inst)
 	if err := applyWrite(ctx, m, inst, body, false); err != nil {
 		return nil, err
 	}
+	cl := h.fileClaims(db)
+	if err := h.acceptFiles(ctx, cl, m, inst, before); err != nil {
+		return nil, err
+	}
 	m.version.set(inst, expected+1)
-	res := db.WithContext(ctx).
-		Model(inst).
-		Where(clause.Eq{Column: clause.Column{Name: m.version.column}, Value: expected}).
-		Select("*").
-		Updates(inst)
-	if res.Error != nil {
-		return nil, database.MapPersistError(ctx, res.Error, "resource already exists", "persist resource")
+	if err := h.writeFiles(ctx, cl, db, m, before, inst, func(tx *gorm.DB) error {
+		res := database.ScopeEdit(tx, inst, stored).WithContext(ctx).
+			Model(inst).
+			Where(clause.Eq{Column: clause.Column{Name: m.version.column}, Value: expected}).
+			Clauses(clause.Where{Exprs: m.fileFence(before)}).
+			Select("*").
+			Omit(withAssociations(m.updateOmits(before, inst))...).
+			Updates(inst)
+		if res.Error != nil {
+			return database.MapPersistError(ctx, res.Error, "resource already exists", "persist resource")
+		}
+		if res.RowsAffected == 0 {
+			// The row was deleted since the load: a 404.
+			if err := rowGone(ctx, tx, m, inst); err != nil {
+				return err
+			}
+			// The version moved, or a file did (the fence): rolls back the
+			// file claims too, the new file abandoned, the old one kept.
+			return contract.WithContext(ctx, contract.Conflict(
+				"The resource was modified by another request; reload and retry."))
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	if res.RowsAffected == 0 {
-		return nil, contract.WithContext(ctx, contract.Conflict(
-			"The resource was modified by another request; reload and retry."))
+	fresh, err := h.loadByID(ctx, m, input.ID)
+	if err != nil {
+		return nil, err
 	}
-	return &rowOutput{Body: contract.Data[row]{Data: m.toRow(inst)}}, nil
+	return h.respond(ctx, m, m.toRow(fresh))
 }
 
 // withoutKey returns a shallow copy of body without key.
@@ -277,7 +338,27 @@ func (h *handlers) deleteResource(ctx context.Context, input *itemInput) (*delet
 	// statement (a referenced row errors, mapped to 409 by MapDeleteError) and
 	// actually executes a declared CASCADE / SET NULL. There is no app-layer
 	// pre-scan to race: the invariant is the database constraint itself.
-	if _, err := database.Delete(ctx, db, inst); err != nil {
+	// The record's files are released in the delete's transaction and
+	// deleted once it has committed.
+	// The delete is fenced on the file keys it loaded: a file attached or
+	// replaced meanwhile makes it a 409 rather than strand that file.
+	before := m.fileKeys(inst)
+	if err := h.writeFiles(ctx, h.fileClaims(db), db, m, before, nil, func(tx *gorm.DB) error {
+		fence := m.fileFence(before)
+		q := tx
+		if len(fence) > 0 {
+			q = tx.Clauses(clause.Where{Exprs: fence})
+		}
+		n, err := database.Delete(ctx, q, inst)
+		if err == nil && n == 0 && len(fence) > 0 {
+			return errFileRace(ctx)
+		}
+		return err
+	}); err != nil {
+		var env *contract.ErrorEnvelope
+		if errors.As(err, &env) {
+			return nil, err // a 409 the claims or the fence already decided
+		}
 		return nil, database.MapDeleteError(ctx, err, "resource is still referenced by other records", "delete resource")
 	}
 	return &deleteOutput{Body: contract.Data[deleteResult]{Data: deleteResult{OK: true}}}, nil
@@ -375,13 +456,24 @@ func splitM2M(ctx context.Context, m *registered, body map[string]any) (ids map[
 // a single transaction, so a bad related id (a 422 from the sync) rolls back the
 // parent insert/update instead of leaving an orphan row. A model with no m2m
 // fields writes directly (no transaction needed).
-func persistWithM2M(ctx context.Context, db *gorm.DB, m *registered, inst any, ids map[string][]any, creating bool) error {
+// An update leaves the omit columns out of its write (registered.updateOmits)
+// and, for a model with file fields, writes only while the record's file
+// columns still hold the keys it loaded (fence: registered.fileFence), a
+// 409 otherwise.
+func persistWithM2M(ctx context.Context, db *gorm.DB, m *registered, inst any, ids map[string][]any, creating bool, omit []string, fence []clause.Expression) error {
 	write := func(tx *gorm.DB) error {
 		var perr error
-		if creating {
+		switch {
+		case creating:
 			perr = tx.WithContext(ctx).Create(inst).Error
-		} else {
-			perr = tx.WithContext(ctx).Save(inst).Error
+		case len(fence) > 0:
+			perr = updateFenced(ctx, tx, m, inst, omit, fence)
+		default:
+			perr = updateRow(ctx, tx, m, inst, omit)
+		}
+		var env *contract.ErrorEnvelope
+		if errors.As(perr, &env) {
+			return perr
 		}
 		if perr != nil {
 			return database.MapPersistError(ctx, perr, "resource already exists", "persist resource")
@@ -463,6 +555,12 @@ func applyWrite(ctx context.Context, m *registered, inst any, body map[string]an
 			fields[name] = []string{"is required"}
 			continue
 		}
+		// A file field's blank key ("" or a file object with an empty key)
+		// is no file: null, which a required field refuses below. An empty
+		// key is never stored (nor does it clear a required file).
+		if f.Type == TypeFile || f.Type == TypeImage {
+			raw = blankFileToNil(raw)
+		}
 		// Write-only values are omitted from the row, so a blank update is
 		// "leave the stored value". Required applies on create only: an edit
 		// must be able to change another column without resubmitting the secret,
@@ -494,7 +592,19 @@ func applyWrite(ctx context.Context, m *registered, inst any, body map[string]an
 			fields[name] = []string{"is required"}
 			continue
 		}
+		// The admin's form sends an integer as a JSON number, which beyond
+		// ±(2^53-1) arrives rounded and is refused. One equal to the row's
+		// stored value rounded the same way is the form sending it back
+		// unchanged: the stored value is kept (issue #448).
+		if !creating && unchangedRoundedInteger(f, inst, raw) {
+			seen[name] = struct{}{}
+			continue
+		}
 		if msg := constraintMessage(f.Field, raw); msg != "" {
+			fields[name] = []string{msg}
+			continue
+		}
+		if msg := writtenTextProblem(f, inst, raw, creating); msg != "" {
 			fields[name] = []string{msg}
 			continue
 		}
@@ -549,6 +659,27 @@ func applyWrite(ctx context.Context, m *registered, inst any, body map[string]an
 	return nil
 }
 
+// writtenTextProblem refuses a NUL byte or invalid UTF-8 in a string the
+// request writes (database.TextProblem; issue #444). The database's text check
+// refuses it too, but only in a column whose Go value it sees as text: not in
+// a type with its own driver.Valuer, which this check still covers. A value
+// the row already stores, sent back unchanged by the admin's form, is not
+// judged again (database.ScopeEdit's rule).
+func writtenTextProblem(f *resolvedField, inst any, raw any, creating bool) string {
+	s, ok := raw.(string)
+	if !ok || (f.Type != TypeString && f.Type != TypeText) {
+		return ""
+	}
+	msg := database.TextProblem(s)
+	if msg == "" || creating {
+		return msg
+	}
+	if same, err := sameAsStored(f, inst, raw); err == nil && same {
+		return ""
+	}
+	return msg
+}
+
 func blankRaw(raw any) bool {
 	if raw == nil {
 		return true
@@ -565,7 +696,7 @@ func sameAsStored(f *resolvedField, inst any, raw any) (bool, error) {
 	if f == nil || f.get == nil {
 		return false, nil
 	}
-	coerced, err := coerceValue(raw, f.Type)
+	coerced, err := coerceValue(raw, f.valueType())
 	if err != nil {
 		return false, err
 	}
@@ -592,7 +723,7 @@ func (f *resolvedField) blankToNull() bool {
 	return patternRejectsEmpty(f.Pattern)
 }
 
-func applySearch(q *gorm.DB, m *registered, term string) (*gorm.DB, error) {
+func applySearch(ctx context.Context, q *gorm.DB, m *registered, term string) (*gorm.DB, error) {
 	// Resolve the registered search field names to columns, then delegate the
 	// LIKE building to the shared database.Search so the admin and the generated
 	// list handler cannot drift on search behavior.
@@ -602,7 +733,7 @@ func applySearch(q *gorm.DB, m *registered, term string) (*gorm.DB, error) {
 			cols = append(cols, col)
 		}
 	}
-	return database.Search(q, cols, term), nil
+	return database.Search(ctx, q, cols, term)
 }
 
 func applyFilters(ctx context.Context, q *gorm.DB, m *registered, values interface{ Get(string) string }) (*gorm.DB, error) {
@@ -618,7 +749,7 @@ func applyFilters(ctx context.Context, q *gorm.DB, m *registered, values interfa
 		if !ok || f.column == "" {
 			continue
 		}
-		val, err := coerceFilter(raw, f.Type)
+		val, err := coerceFilter(raw, f.valueType())
 		if err != nil {
 			return nil, contract.WithContext(ctx, contract.Validation("The request contains invalid fields.", map[string][]string{
 				name: {err.Error()},
@@ -653,4 +784,94 @@ func applyOrdering(q *gorm.DB, m *registered, ordering string) (*gorm.DB, error)
 		return nil, errors.New("ordering is not allowed for this field")
 	}
 	return q.Order(clause.OrderByColumn{Column: clause.Column{Name: col}, Desc: desc}), nil
+}
+
+// updateRow writes an edit of a loaded row (issue #450). Under the PATCH's
+// database.ScopeEdit only the columns the edit, or a model hook, changed are
+// written, so a concurrent change to another column is not reverted, and
+// never the row's associations (a has_many child moved or deleted meanwhile
+// is not written back; many-to-many ids are synced by syncM2M). A row deleted
+// since it was loaded is a 404, where Save would have inserted it again.
+func updateRow(ctx context.Context, tx *gorm.DB, m *registered, inst any, omit []string) error {
+	res := tx.WithContext(ctx).Model(inst).Select("*").Omit(withAssociations(omit)...).Updates(inst)
+	if res.Error != nil || res.RowsAffected > 0 {
+		return res.Error
+	}
+	// No row updated: deleted since the load, or matched but left unchanged
+	// (MySQL counts such a row as not affected).
+	return rowGone(ctx, tx, m, inst)
+}
+
+// rowGone is the 404 for an update that found no row because the row was
+// deleted since it was loaded; nil when the row is still there.
+func rowGone(ctx context.Context, tx *gorm.DB, m *registered, inst any) error {
+	pk, ok := m.fieldByName[m.meta.PK]
+	if !ok {
+		return contract.WithContext(ctx, contract.NotFound("unknown resource"))
+	}
+	var n int64
+	if err := tx.WithContext(ctx).Model(inst).
+		Where(clause.Eq{Column: clause.Column{Name: m.pkColumn}, Value: pk.get(inst)}).
+		Count(&n).Error; err != nil {
+		return err
+	}
+	if n == 0 {
+		return contract.WithContext(ctx, contract.NotFound("unknown resource"))
+	}
+	return nil
+}
+
+// withAssociations adds clause.Associations to an update's omitted columns:
+// an admin edit writes the row's own columns only.
+func withAssociations(omit []string) []string {
+	return append(append(make([]string, 0, len(omit)+1), omit...), clause.Associations)
+}
+
+// updateFenced writes inst (the columns the edit changed, never its
+// associations; see updateRow) while the record still matches fence
+// (registered.fileFence). No matching row is a 404 when the row was deleted,
+// else a 409, unless the row does match and the write merely changed nothing
+// (MySQL reports such a row as unaffected).
+func updateFenced(ctx context.Context, tx *gorm.DB, m *registered, inst any, omit []string, fence []clause.Expression) error {
+	res := tx.WithContext(ctx).Model(inst).Clauses(clause.Where{Exprs: fence}).Select("*").Omit(withAssociations(omit)...).Updates(inst)
+	if res.Error != nil || res.RowsAffected > 0 {
+		return res.Error
+	}
+	// A row deleted since the load is a 404, not a file race.
+	if err := rowGone(ctx, tx, m, inst); err != nil {
+		return err
+	}
+	pk, ok := m.fieldByName[m.meta.PK]
+	if !ok {
+		return errFileRace(ctx)
+	}
+	var n int64
+	if err := tx.WithContext(ctx).Model(inst).
+		Clauses(clause.Where{Exprs: fence}).
+		Where(clause.Eq{Column: clause.Column{Name: m.pkColumn}, Value: pk.get(inst)}).
+		Count(&n).Error; err != nil {
+		return err
+	}
+	if n == 0 {
+		return errFileRace(ctx)
+	}
+	return nil
+}
+
+// blankFileToNil is nil for a file field's blank value: "", or a file object
+// whose key is the string "". Anything else is returned as it is, a
+// malformed object (no key, a null or non-string one) included, for
+// coerceValue to refuse: a malformed request must never read as "remove the
+// file".
+func blankFileToNil(raw any) any {
+	if obj, ok := raw.(map[string]any); ok {
+		if key, ok := obj["key"].(string); ok && key == "" {
+			return nil
+		}
+		return raw
+	}
+	if s, ok := raw.(string); ok && s == "" {
+		return nil
+	}
+	return raw
 }

@@ -25,10 +25,14 @@ type AuthMeta struct {
 
 // ModelMeta is one registered model in the introspection API.
 type ModelMeta struct {
-	Slug        string       `json:"slug"`
-	Singular    string       `json:"singular"`
-	Plural      string       `json:"plural"`
-	PK          string       `json:"pk"`
+	Slug     string `json:"slug"`
+	Singular string `json:"singular"`
+	Plural   string `json:"plural"`
+	PK       string `json:"pk"`
+	// Version names the optimistic-lock field an update guards on, when the
+	// model has one: the edit form always sends the value it loaded, so a
+	// concurrent edit is a 409 (issue #454).
+	Version     string       `json:"version,omitempty"`
 	Fields      []FieldMeta  `json:"fields"`
 	List        []string     `json:"list"`
 	Search      []string     `json:"search"`
@@ -64,6 +68,10 @@ type FieldMeta struct {
 	Default   string    `json:"default,omitempty"`
 	Format    string    `json:"format,omitempty"`
 	Choices   []Choice  `json:"choices,omitempty"`
+	// Accept and MaxBytes: a file or image field's upload policy, as hints
+	// for the form (the server enforces them).
+	Accept   []string `json:"accept,omitempty"`
+	MaxBytes int64    `json:"max_bytes,omitempty"`
 }
 
 type catalogOutput struct {
@@ -100,6 +108,8 @@ func modelMetaFrom(opts Options, pk string) ModelMeta {
 			Default:   f.Default,
 			Format:    f.Format,
 			Choices:   cloneChoices(f.Choices),
+			Accept:    append([]string(nil), f.Accept...),
+			MaxBytes:  f.MaxBytes,
 		})
 	}
 	return ModelMeta{

@@ -229,6 +229,26 @@ func TestMetaAnonymousUnauthorized(t *testing.T) {
 	assertError(t, rec, http.StatusUnauthorized, "authentication")
 }
 
+// An access cookie that is still live does not outlive its session: once the
+// session's refresh token has expired, the admin answers as it does without a
+// cookie.
+func TestMetaExpiredSessionUnauthorized(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	app := newCookieApp(t)
+	registerWidgets(t, app)
+	jar := loginSuperuser(t, app)
+	if rec := doRequest(app, jar, http.MethodGet, "/api/v1/admin/meta", ""); rec.Code != http.StatusOK {
+		t.Fatalf("meta with an active session: status = %d; body: %s", rec.Code, rec.Body.String())
+	}
+	// The session expires; the access cookie, a minute long, is still live.
+	if err := app.DB().Model(&auth.RefreshToken{}).Where("revoked_at IS NULL").
+		Update("expires_at", time.Now().Add(-time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
+	rec := doRequest(app, jar, http.MethodGet, "/api/v1/admin/meta", "")
+	assertError(t, rec, http.StatusUnauthorized, "authentication")
+}
+
 func TestMetaNonSuperuserForbidden(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	app := newCookieApp(t)
@@ -403,5 +423,43 @@ func TestAdminOpenAPISchemaNamesAreValid(t *testing.T) {
 	valid, documentErrs := validator.ValidateDocument()
 	if !valid || len(documentErrs) > 0 {
 		t.Fatalf("validate OpenAPI 3.1 document: valid=%v errors=%v", valid, documentErrs)
+	}
+}
+
+type metaVersioned struct {
+	ID      uint   `gorm:"primaryKey" json:"id"`
+	Title   string `json:"title"`
+	Version int64  `json:"version"`
+}
+
+// The meta names a model's optimistic-lock field, which the SPA's edit form
+// always sends as loaded (issue #454); a model without one has none.
+func TestMetaNamesTheVersionField(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	app := newCookieApp(t)
+	if err := app.DB().AutoMigrate(&metaVersioned{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.Register(app, metaVersioned{}, admin.Options{Slug: "meta-versioned"}); err != nil {
+		t.Fatal(err)
+	}
+	registerWidgets(t, app)
+	jar := loginSuperuser(t, app)
+	for slug, want := range map[string]string{"meta-versioned": "version", "widgets": ""} {
+		rec := doRequest(app, jar, http.MethodGet, "/api/v1/admin/meta/"+slug, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("meta %s: %d %s", slug, rec.Code, rec.Body.String())
+		}
+		var env struct {
+			Data struct {
+				Version string `json:"version"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatal(err)
+		}
+		if env.Data.Version != want {
+			t.Errorf("meta %s version = %q, want %q", slug, env.Data.Version, want)
+		}
 	}
 }

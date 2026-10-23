@@ -11,12 +11,12 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/gombit-dev/gombit/admin"
 	"github.com/gombit-dev/gombit/auth"
 	"github.com/gombit-dev/gombit/config"
 	"github.com/gombit-dev/gombit/database"
 	"github.com/gombit-dev/gombit/framework"
-	"github.com/gin-gonic/gin"
 )
 
 var (
@@ -36,6 +36,90 @@ func TestResourceMySQL(t *testing.T) {
 		t.Skip("set -admin.mysql-dsn to run MySQL admin integration tests")
 	}
 	runResourceDriver(t, config.DatabaseDriverMySQL, *mysqlDSN)
+}
+
+func TestTextAdminPostgres(t *testing.T) {
+	if *postgresDSN == "" {
+		t.Skip("set -admin.postgres-dsn to run Postgres admin integration tests")
+	}
+	runTextAdmin(t, openAdminDriver(t, config.DatabaseDriverPostgres, *postgresDSN))
+}
+
+func TestTextAdminMySQL(t *testing.T) {
+	if *mysqlDSN == "" {
+		t.Skip("set -admin.mysql-dsn to run MySQL admin integration tests")
+	}
+	runTextAdmin(t, openAdminDriver(t, config.DatabaseDriverMySQL, *mysqlDSN))
+}
+
+func TestStoredZeroAdminPostgres(t *testing.T) {
+	if *postgresDSN == "" {
+		t.Skip("set -admin.postgres-dsn to run Postgres admin integration tests")
+	}
+	runStoredZeroAdmin(t, openAdminDriver(t, config.DatabaseDriverPostgres, *postgresDSN))
+}
+
+func TestStoredZeroAdminMySQL(t *testing.T) {
+	if *mysqlDSN == "" {
+		t.Skip("set -admin.mysql-dsn to run MySQL admin integration tests")
+	}
+	runStoredZeroAdmin(t, openAdminDriver(t, config.DatabaseDriverMySQL, *mysqlDSN))
+}
+
+func TestIntRangeAdminPostgres(t *testing.T) {
+	if *postgresDSN == "" {
+		t.Skip("set -admin.postgres-dsn to run Postgres admin integration tests")
+	}
+	runIntRangeAdmin(t, openAdminDriver(t, config.DatabaseDriverPostgres, *postgresDSN))
+}
+
+func TestIntRangeAdminMySQL(t *testing.T) {
+	if *mysqlDSN == "" {
+		t.Skip("set -admin.mysql-dsn to run MySQL admin integration tests")
+	}
+	runIntRangeAdmin(t, openAdminDriver(t, config.DatabaseDriverMySQL, *mysqlDSN))
+}
+
+func TestPartialPatchAdminPostgres(t *testing.T) {
+	if *postgresDSN == "" {
+		t.Skip("set -admin.postgres-dsn to run Postgres admin integration tests")
+	}
+	runPartialPatchAdmin(t, openAdminDriver(t, config.DatabaseDriverPostgres, *postgresDSN))
+}
+
+func TestPartialPatchAdminMySQL(t *testing.T) {
+	if *mysqlDSN == "" {
+		t.Skip("set -admin.mysql-dsn to run MySQL admin integration tests")
+	}
+	runPartialPatchAdmin(t, openAdminDriver(t, config.DatabaseDriverMySQL, *mysqlDSN))
+}
+
+func TestFloatAdminPostgres(t *testing.T) {
+	if *postgresDSN == "" {
+		t.Skip("set -admin.postgres-dsn to run Postgres admin integration tests")
+	}
+	runFloatAdmin(t, openAdminDriver(t, config.DatabaseDriverPostgres, *postgresDSN))
+}
+
+func TestFloatAdminMySQL(t *testing.T) {
+	if *mysqlDSN == "" {
+		t.Skip("set -admin.mysql-dsn to run MySQL admin integration tests")
+	}
+	runFloatAdmin(t, openAdminDriver(t, config.DatabaseDriverMySQL, *mysqlDSN))
+}
+
+func TestStringKeyAdminPostgres(t *testing.T) {
+	if *postgresDSN == "" {
+		t.Skip("set -admin.postgres-dsn to run Postgres admin integration tests")
+	}
+	runStringKeyAdmin(t, openAdminDriver(t, config.DatabaseDriverPostgres, *postgresDSN))
+}
+
+func TestStringKeyAdminMySQL(t *testing.T) {
+	if *mysqlDSN == "" {
+		t.Skip("set -admin.mysql-dsn to run MySQL admin integration tests")
+	}
+	runStringKeyAdmin(t, openAdminDriver(t, config.DatabaseDriverMySQL, *mysqlDSN))
 }
 
 func runResourceDriver(t *testing.T, driver config.DatabaseDriver, dsn string) {

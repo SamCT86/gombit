@@ -15,7 +15,7 @@ import (
 )
 
 // Field is one parsed resource field from the CLI grammar
-// name:type[:required][,unique][,index] (design §27 subset).
+// name:type[:modifier[,modifier...]] (docs/cli.md).
 type Field struct {
 	Name     string
 	JSONName string
@@ -294,6 +294,8 @@ const (
 	FieldSlug      FieldType = FieldType(logical.Slug)
 	FieldIP        FieldType = FieldType(logical.IP)
 	FieldEnum      FieldType = FieldType(logical.Enum)
+	FieldFile      FieldType = FieldType(logical.File)
+	FieldImage     FieldType = FieldType(logical.Image)
 
 	FieldBelongsTo  FieldType = FieldType(logical.RelBelongsTo)
 	FieldHasMany    FieldType = FieldType(logical.RelHasMany)
@@ -413,6 +415,12 @@ func parseField(spec, resourcePkg string, lookup pkLookup) (Field, error) {
 		GoName:   goName,
 	}
 	if err := applyType(&field, typeToken); err != nil {
+		// Modifiers follow a second colon. name:type,modifier reads
+		// naturally, and would be reported as an unknown type
+		// "type,modifier": say what the grammar wants instead.
+		if hint := commaModifierHint(spec, name, typeToken, parts); hint != nil {
+			return Field{}, hint
+		}
 		return Field{}, err
 	}
 	if len(parts) == 3 {
@@ -440,6 +448,53 @@ func parseField(spec, resourcePkg string, lookup pkLookup) (Field, error) {
 		field.GoType = "types.NullJSON"
 	}
 	return field, nil
+}
+
+// commaModifierHint explains a type token the type parser refused because a
+// comma outside its arguments (notes:text,searchable) put modifiers where the
+// type goes: modifiers follow a second colon. When the text before the comma
+// is a known type, the error spells the field the grammar wants. It returns
+// nil when the token has no such comma, leaving the parser's own error; it
+// is only consulted after the parser refused the token, so it never rejects a
+// spec the parser accepts.
+func commaModifierHint(spec, name, typeToken string, parts []string) error {
+	depth, comma := 0, -1
+	for i, r := range typeToken {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 && comma < 0 {
+				comma = i
+			}
+		}
+	}
+	if comma < 0 {
+		return nil
+	}
+	head, modifiers := strings.TrimSpace(typeToken[:comma]), strings.TrimSpace(typeToken[comma+1:])
+	base, _, _ := splitTypeArgs(head)
+	kind, rel, ok := logical.ParseCLI(base)
+	switch {
+	case ok && rel != "":
+		return fmt.Errorf("resourcegen: field %q: a relation is name:%s:Target, with modifiers after the target (name:%s:Target,nullable)", spec, rel, rel)
+	case !ok || kind == "":
+		return fmt.Errorf("resourcegen: field %q: unknown type %q (supported: %s); modifiers follow a second colon (name:type:modifier,modifier)",
+			spec, head, strings.Join(logical.PreferredGeneratorTokens(), ", "))
+	}
+	// What followed a further colon is more modifiers (",") unless the last
+	// modifier before it holds a value the colon belongs to
+	// (default=https://example.com).
+	if len(parts) == 3 && strings.TrimSpace(parts[2]) != "" {
+		sep := ","
+		if mods := strings.Split(modifiers, ","); strings.Contains(mods[len(mods)-1], "=") {
+			sep = ":"
+		}
+		modifiers += sep + strings.TrimSpace(parts[2])
+	}
+	return fmt.Errorf("resourcegen: field %q: modifiers follow a second colon, not a comma: %s:%s:%s", spec, name, head, modifiers)
 }
 
 // applyType parses the type token (which may carry arguments, e.g.
@@ -1266,6 +1321,10 @@ func (f Field) gormTag() string {
 		// Nanoseconds in a signed bigint. A native interval type is not
 		// portable to SQLite.
 		parts = append(parts, "type:bigint")
+	case FieldFile, FieldImage:
+		// The object key. 512 bytes keeps the unique index within MySQL's
+		// key length (utf8mb4).
+		parts = append(parts, "size:512")
 	}
 	if f.Required && !f.Nullable {
 		parts = append(parts, "not null")
@@ -1277,7 +1336,9 @@ func (f Field) gormTag() string {
 		parts = append(parts, "check:"+check)
 	}
 	switch {
-	case f.Unique:
+	case f.Unique, f.Type == FieldFile, f.Type == FieldImage:
+		// A file belongs to one record: the unique index backs up the
+		// claim the record holds (storage/claims).
 		parts = append(parts, "uniqueIndex")
 	case f.Index:
 		parts = append(parts, "index")
@@ -1378,7 +1439,7 @@ func (f Field) blankIsNull() bool {
 		return false
 	}
 	switch f.Type {
-	case FieldTime, FieldDecimal, FieldDate, FieldUUID, FieldEmail, FieldURL, FieldSlug, FieldIP, FieldTimeOfDay, FieldDuration:
+	case FieldTime, FieldDecimal, FieldDate, FieldUUID, FieldEmail, FieldURL, FieldSlug, FieldIP, FieldTimeOfDay, FieldDuration, FieldFile, FieldImage:
 		return true
 	case FieldString, FieldText:
 		return patternRejectsEmpty(f.Pattern)
@@ -1433,4 +1494,14 @@ func (f Field) enumLabel(i int) string {
 		return f.EnumValues[i]
 	}
 	return ""
+}
+
+// storageTag is a file or image field's `storage` tag: the prefix it owns,
+// <package>/<field>/, which gombit generate turns into its upload policy
+// (filefield.Policy). Empty for other kinds.
+func (f Field) storageTag(resourcePkg string) string {
+	if f.Type != FieldFile && f.Type != FieldImage {
+		return ""
+	}
+	return `storage:"prefix=` + resourcePkg + "/" + f.JSONName + `/"`
 }
