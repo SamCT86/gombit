@@ -509,6 +509,12 @@ releases:
 
   - version: unreleased
     changes:
+      - id: classify-expired-lease-exhaustion
+        kind: informational
+        area: behavior
+        summary: "Expired-lease exhaustion is reported as `lease_expired` instead of a handler failure."
+        refs: [525]
+
       - id: refresh-follower-not-cancelled-by-leader
         kind: informational
         area: behavior
