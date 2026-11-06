@@ -225,7 +225,12 @@ func (w *Worker) reserve(ctx context.Context) (Delivery, error) {
 		if !d.AvailableAt.IsZero() && started.After(d.AvailableAt) {
 			waited = started.Sub(d.AvailableAt)
 		}
-		exhaustErr := errors.New("previous worker did not settle the job before its lease expired")
+		// No handler returned an error; the only observed fact is an
+		// expired lease. Preserve that provenance in logs and failed-job data.
+		exhaustErr := &Error{
+			Kind: KindLeaseExpired, Name: d.Envelope.Name,
+			Err: errors.New("previous worker did not settle the job before its lease expired"),
+		}
 		fields := []zap.Field{
 			zap.String("job_id", d.Envelope.ID),
 			zap.String("job", d.Envelope.Name),
@@ -233,7 +238,7 @@ func (w *Worker) reserve(ctx context.Context) (Delivery, error) {
 			zap.Int("attempt", d.Envelope.Attempt),
 			zap.Duration("duration", 0),
 			zap.Duration("waited", waited),
-			zap.String("kind", string(KindHandler)),
+			zap.String("kind", string(KindLeaseExpired)),
 			zap.Error(exhaustErr),
 		}
 		if len(d.Envelope.Metadata) > 0 {

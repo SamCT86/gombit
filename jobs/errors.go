@@ -27,6 +27,9 @@ const (
 	KindUpgrade Kind = "upgrade"
 	// KindHandler: the handler returned an error.
 	KindHandler Kind = "handler"
+	// KindLeaseExpired: a prior worker did not settle a delivery before its
+	// lease expired. The underlying cause is unknown; no handler error was observed.
+	KindLeaseExpired Kind = "lease_expired"
 )
 
 // Sentinels for errors.Is. Each matches every Error of its Kind.
@@ -38,6 +41,7 @@ var (
 	ErrTimeout            = errors.New("jobs: job timed out")
 	ErrUpgrade            = errors.New("jobs: job upgrade step failed")
 	ErrHandler            = errors.New("jobs: job handler failed")
+	ErrLeaseExpired       = errors.New("jobs: job lease expired before settlement")
 )
 
 var kindSentinels = map[Kind]error{
@@ -48,6 +52,7 @@ var kindSentinels = map[Kind]error{
 	KindTimeout:            ErrTimeout,
 	KindUpgrade:            ErrUpgrade,
 	KindHandler:            ErrHandler,
+	KindLeaseExpired:       ErrLeaseExpired,
 }
 
 // Error is a classified job failure. Err is the underlying cause (the
@@ -80,6 +85,8 @@ func (e *Error) Error() string {
 		return fmt.Sprintf("jobs: %s timed out: %v", subject, e.Err)
 	case KindUpgrade:
 		return fmt.Sprintf("jobs: upgrade %s from version %d: %v", subject, e.Version, e.Err)
+	case KindLeaseExpired:
+		return fmt.Sprintf("jobs: %s lease expired before settlement: %v", subject, e.Err)
 	default:
 		return fmt.Sprintf("jobs: %s failed: %v", subject, e.Err)
 	}

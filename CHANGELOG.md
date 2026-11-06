@@ -12,6 +12,11 @@ version.
 
 ### Added
 
+- Expired-lease redelivery exhaustion now records the distinct `lease_expired`
+  failure kind (`jobs.KindLeaseExpired`) in failed jobs and structured logs
+  instead of incorrectly reporting a handler error. The underlying cause
+  remains unknown (see [#525](https://github.com/gombit-dev/gombit/pull/525)).
+
 - [Account state](docs/auth.md#account-state) (AUTH-6), in both auth
   modes. An account is active or disabled (`User.DisabledAt`). Disabling it
   (`POST /auth/users/{id}/disable`, or `auth.Service.DisableUser`) revokes
