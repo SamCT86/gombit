@@ -255,6 +255,8 @@ compatibility manifest (see [upgrade.md](upgrade.md)).
 
 ### Informational
 
+- Expired-lease exhaustion is reported as `lease_expired` instead of a handler failure. (`classify-expired-lease-exhaustion`, behavior, [#525](https://github.com/gombit-dev/gombit/issues/525))
+
 - A refresh that joins another request's rotation of the same token no longer fails with that request's `context canceled` (a 500) when its client disconnects: the shared rotation runs detached from every caller's cancellation and deadline, its transaction bounded by a 10-second timeout. (`refresh-follower-not-cancelled-by-leader`, behavior, [#462](https://github.com/gombit-dev/gombit/issues/462))
 
   A rotation whose first caller disconnects or passes its request

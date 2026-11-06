@@ -263,6 +263,13 @@ that does not set its own, and fills the fields a job leaves zero.
   with its ID, name, attempt, the reason, and the `gombit jobs inspect` command
   for it, but not its payload.
 
+If a previous worker leaves a delivery unsettled and a later expired-lease
+redelivery would exceed `MaxAttempts`, the worker moves the job to failed
+jobs without running the handler. Its `Reason` is `attempts exhausted`,
+but its `Failure.Kind` and structured log `kind` are `lease_expired`
+(`KindLeaseExpired`): only the lease expiry is observed. This does not
+claim that a handler returned an error or that the previous worker crashed.
+
 The attempt count and the retry time live in the queue. With Redis both
 survive worker restarts: a job that failed under one worker runs its next
 attempt under another, not before its backoff, and `MaxAttempts` counts

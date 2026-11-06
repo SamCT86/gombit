@@ -300,12 +300,29 @@ func TestWorkerStopsCrashRedeliveryPastMaxAttempts(t *testing.T) {
 		t.Fatalf("handler ran %d times after three crashed deliveries with MaxAttempts 3; want no fourth run", runs.Load())
 	}
 	failed, _ := q.Failed(context.Background(), "default", 0)
-	if f := failed[0]; f.Attempts != 4 || f.Failure.Reason != jobs.ReasonExhausted || f.Failure.Error == "" {
+	if f := failed[0]; f.Attempts != 4 || f.Failure.Reason != jobs.ReasonExhausted || f.Failure.Kind != jobs.KindLeaseExpired || f.Failure.Error == "" {
 		t.Fatalf("failed job = %+v, want attempt 4 set aside as attempts exhausted", f)
 	}
 	gaveUp := logs.FilterMessage("job failed for good").All()
-	if len(gaveUp) != 1 || gaveUp[0].ContextMap()["attempt"] != int64(4) || gaveUp[0].ContextMap()["max_attempts"] != int64(3) {
+	if len(gaveUp) != 1 || gaveUp[0].ContextMap()["attempt"] != int64(4) ||
+		gaveUp[0].ContextMap()["max_attempts"] != int64(3) ||
+		gaveUp[0].ContextMap()["kind"] != string(jobs.KindLeaseExpired) {
 		t.Fatalf("give-up logs = %+v, want attempt 4 past MaxAttempts 3", gaveUp)
+	}
+}
+
+// TestLeaseExpiryClassificationIsNotAHandlerFailure pins the public
+// failure-kind and errors.Is contract independently of the queue implementation.
+func TestLeaseExpiryClassificationIsNotAHandlerFailure(t *testing.T) {
+	err := &jobs.Error{
+		Kind: jobs.KindLeaseExpired, Name: "block_job",
+		Err: errors.New("lease expired without settlement"),
+	}
+	if got := jobs.Classify(err); got != jobs.KindLeaseExpired {
+		t.Fatalf("Classify lease expiry = %q, want %q", got, jobs.KindLeaseExpired)
+	}
+	if !errors.Is(err, jobs.ErrLeaseExpired) || errors.Is(err, jobs.ErrHandler) {
+		t.Fatalf("lease expiry must match ErrLeaseExpired, never ErrHandler: %v", err)
 	}
 }
 
