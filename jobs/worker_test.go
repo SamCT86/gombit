@@ -483,13 +483,18 @@ func TestNewWorkerValidates(t *testing.T) {
 // stubbornQueue.)
 type ctxQueue struct {
 	*jobs.MemoryQueue
-	reserveBlocks bool          // Reserve waits for ctx
-	reserveDelay  time.Duration // Reserve ignores ctx, then answers
-	extendBlocks  bool          // Extend waits for ctx
-	released      atomic.Int32
+	reserveBlocks  bool          // Reserve waits for ctx
+	reserveDelay   time.Duration // Reserve ignores ctx, then answers
+	reserveEntered chan struct{} // Optional test signal, before the slow Reserve
+	extendBlocks   bool          // Extend waits for ctx
+	released       atomic.Int32
+	postponed      atomic.Int32
 }
 
 func (q *ctxQueue) Reserve(ctx context.Context, queues []string, lease time.Duration) (jobs.Delivery, error) {
+	if q.reserveEntered != nil {
+		q.reserveEntered <- struct{}{}
+	}
 	if q.reserveBlocks {
 		<-ctx.Done()
 		return jobs.Delivery{}, ctx.Err()
@@ -509,6 +514,11 @@ func (q *ctxQueue) Extend(ctx context.Context, d jobs.Delivery, lease time.Durat
 func (q *ctxQueue) Release(ctx context.Context, d jobs.Delivery, at time.Time) error {
 	q.released.Add(1)
 	return q.MemoryQueue.Release(ctx, d, at)
+}
+
+func (q *ctxQueue) Postpone(ctx context.Context, d jobs.Delivery, at time.Time) error {
+	q.postponed.Add(1)
+	return q.MemoryQueue.Postpone(ctx, d, at)
 }
 
 func TestShutdownCancelsAReserveInFlight(t *testing.T) {
@@ -538,22 +548,29 @@ func TestADeliveryAfterShutdownIsHandedBack(t *testing.T) {
 	reg := jobs.NewRegistry()
 	var ran atomic.Bool
 	jobs.MustRegister(reg, func(context.Context, blockJob) error { ran.Store(true); return nil })
-	q := &ctxQueue{MemoryQueue: jobs.NewMemoryQueue(), reserveDelay: 150 * time.Millisecond}
+	q := &ctxQueue{MemoryQueue: jobs.NewMemoryQueue(), reserveDelay: 150 * time.Millisecond, reserveEntered: make(chan struct{}, 1)}
 	dispatchN(t, jobs.NewDispatcher(reg, q.MemoryQueue), 1)
-	w, err := jobs.NewWorker(reg, q, jobs.WorkerOptions{Queues: []string{"default"}})
-	if err != nil {
-		t.Fatal(err)
+	// Three shutdowns must not consume attempts for a handler that never ran.
+	for i := 0; i < 3; i++ {
+		w, err := jobs.NewWorker(reg, q, jobs.WorkerOptions{Queues: []string{"default"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stop := startWorker(t, w)
+		select {
+		case <-q.reserveEntered: // Stop deterministically after Reserve starts, before its delayed reply.
+		case <-time.After(3 * time.Second):
+			t.Fatal("worker never entered Reserve")
+		}
+		if err := stop(); err != nil {
+			t.Fatal(err)
+		}
 	}
-	stop := startWorker(t, w)
-	time.Sleep(30 * time.Millisecond) // inside the slow Reserve
-	if err := stop(); err != nil {
-		t.Fatal(err)
+	if ran.Load() || q.released.Load() != 0 || q.postponed.Load() != 3 {
+		t.Fatalf("ran = %v, released %d, postponed %d; want 0 handler runs, no Release, three attempt-preserving Postpones", ran.Load(), q.released.Load(), q.postponed.Load())
 	}
-	if ran.Load() || q.released.Load() != 1 {
-		t.Fatalf("ran = %v, released %d; want the late delivery handed back unstarted", ran.Load(), q.released.Load())
-	}
-	if d, err := q.MemoryQueue.Reserve(context.Background(), []string{"default"}, time.Minute); err != nil || d.Envelope.ID == "" {
-		t.Fatalf("the job is not back in the queue: %+v, %v", d, err)
+	if d, err := q.MemoryQueue.Reserve(context.Background(), []string{"default"}, time.Minute); err != nil || d.Envelope.Attempt != 1 {
+		t.Fatalf("after three unstarted handbacks the next delivery must be attempt 1: %+v, %v", d, err)
 	}
 }
 

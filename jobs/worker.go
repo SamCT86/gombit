@@ -160,9 +160,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			<-slots
 			if err == nil {
-				if relErr := w.release(d, time.Now()); relErr != nil {
-					w.log.Warn("jobs worker: returning a job reserved during shutdown; it returns when its lease expires",
-						zap.String("job_id", d.Envelope.ID), zap.Error(relErr))
+				if handBackErr := w.returnUnstarted(d); handBackErr != nil {
+					w.log.Warn("jobs worker: unstarted delivery could not be postponed during shutdown; it returns when its lease expires",
+						zap.String("job_id", d.Envelope.ID), zap.Error(handBackErr))
 				}
 			}
 			return w.shutdown(&inFlight, cancelJobs)
@@ -518,6 +518,15 @@ func (w *Worker) release(d Delivery, at time.Time) error {
 	ctx, cancel := context.WithTimeout(context.Background(), queueOpTimeout)
 	defer cancel()
 	return w.queue.Release(ctx, d, at)
+}
+
+// returnUnstarted takes back the attempt Reserve counted for a delivery
+// caught by shutdown before any handler ran. Unlike Release, Postpone
+// preserves MaxAttempts for work that did not start.
+func (w *Worker) returnUnstarted(d Delivery) error {
+	ctx, cancel := context.WithTimeout(context.Background(), queueOpTimeout)
+	defer cancel()
+	return w.queue.Postpone(ctx, d, time.Now())
 }
 
 // shutdown waits for in-flight jobs up to ShutdownTimeout, then cancels them
