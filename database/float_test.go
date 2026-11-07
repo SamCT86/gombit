@@ -12,6 +12,7 @@ import (
 	"github.com/gombit-dev/gombit/config"
 	"github.com/gombit-dev/gombit/contract"
 	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type floatItem struct {
@@ -118,11 +119,16 @@ func TestFloatCheckAddsNoAllocationsToOrdinaryWrites(t *testing.T) {
 	measure := func(db *DB) map[string]float64 {
 		row := floatItem{Name: "x", Ratio: 1}
 		db.Create(&row)
+		// Slow-query logging allocates independently of the validation callback;
+		// exclude its timing variability from this allocation comparison.
+		previousLogger := db.Config.Logger
+		db.Config.Logger = gormlogger.Discard
+		defer func() { db.Config.Logger = previousLogger }()
 		return map[string]float64{
-			"Create":          testing.AllocsPerRun(50, func() { db.Create(&floatItem{Name: "x", Ratio: 2}) }),
-			"Save":            testing.AllocsPerRun(50, func() { db.Save(&row) }),
-			"Updates(map)":    testing.AllocsPerRun(50, func() { db.Model(&row).Updates(map[string]any{"ratio": 3.5}) }),
-			"Updates(struct)": testing.AllocsPerRun(50, func() { db.Model(&row).Updates(floatItem{Ratio: 4}) }),
+			"Create":          fractionalAllocsPerRun(50, func() { db.Create(&floatItem{Name: "x", Ratio: 2}) }),
+			"Save":            fractionalAllocsPerRun(50, func() { db.Save(&row) }),
+			"Updates(map)":    fractionalAllocsPerRun(50, func() { db.Model(&row).Updates(map[string]any{"ratio": 3.5}) }),
+			"Updates(struct)": fractionalAllocsPerRun(50, func() { db.Model(&row).Updates(floatItem{Ratio: 4}) }),
 		}
 	}
 	without, with := measure(open(false)), measure(open(true))

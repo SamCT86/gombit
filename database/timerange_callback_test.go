@@ -14,6 +14,7 @@ import (
 	"github.com/gombit-dev/gombit/types"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type rangedEvent struct {
@@ -594,11 +595,16 @@ func TestTimeRangeAddsNoAllocationsToOrdinaryWrites(t *testing.T) {
 	measure := func(db *DB) map[string]float64 {
 		row := allocStamped{Name: "x"}
 		db.Create(&row)
+		// Slow-query logging allocates independently of the validation callback;
+		// exclude its timing variability from this allocation comparison.
+		previousLogger := db.Config.Logger
+		db.Config.Logger = gormlogger.Discard
+		defer func() { db.Config.Logger = previousLogger }()
 		return map[string]float64{
-			"Create":          testing.AllocsPerRun(50, func() { db.Create(&allocStamped{Name: "x"}) }),
-			"Save":            testing.AllocsPerRun(50, func() { db.Save(&row) }),
-			"Updates(map)":    testing.AllocsPerRun(50, func() { db.Model(&row).Updates(map[string]any{"name": "y"}) }),
-			"Updates(struct)": testing.AllocsPerRun(50, func() { db.Model(&row).Updates(allocStamped{Name: "z"}) }),
+			"Create":          fractionalAllocsPerRun(50, func() { db.Create(&allocStamped{Name: "x"}) }),
+			"Save":            fractionalAllocsPerRun(50, func() { db.Save(&row) }),
+			"Updates(map)":    fractionalAllocsPerRun(50, func() { db.Model(&row).Updates(map[string]any{"name": "y"}) }),
+			"Updates(struct)": fractionalAllocsPerRun(50, func() { db.Model(&row).Updates(allocStamped{Name: "z"}) }),
 		}
 	}
 	// The database measured second now and then counts one allocation more,
