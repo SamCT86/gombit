@@ -283,6 +283,15 @@ compatibility manifest (see [upgrade.md](upgrade.md)).
 
 ### Informational
 
+- A worker stopping after Reserve but before running a job returns that delivery without spending a retry attempt. (`worker-unstarted-shutdown-delivery-attempts`, behavior, [#495](https://github.com/gombit-dev/gombit/issues/495))
+
+  If shutdown arrived while Reserve was in flight, the worker used
+  Release when the late delivery arrived, consuming an attempt although
+  its handler never started. Repeated restarts could exhaust a job's
+  MaxAttempts without running it. The worker now uses Queue.Postpone
+  for this case, preserving the attempt budget; jobs already executing
+  still follow the normal retry and shutdown semantics.
+
 - A refresh that joins another request's rotation of the same token no longer fails with that request's `context canceled` (a 500) when its client disconnects: the shared rotation runs detached from every caller's cancellation and deadline, its transaction bounded by a 10-second timeout. (`refresh-follower-not-cancelled-by-leader`, behavior, [#462](https://github.com/gombit-dev/gombit/issues/462))
 
   A rotation whose first caller disconnects or passes its request

@@ -160,7 +160,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			<-slots
 			if err == nil {
-				if relErr := w.release(d, time.Now()); relErr != nil {
+				if relErr := w.postponeDelivery(d, time.Now()); relErr != nil {
 					w.log.Warn("jobs worker: returning a job reserved during shutdown; it returns when its lease expires",
 						zap.String("job_id", d.Envelope.ID), zap.Error(relErr))
 				}
@@ -402,9 +402,7 @@ func (w *Worker) retry(d Delivery, delay time.Duration, fields []zap.Field) erro
 // delivery as an attempt.
 func (w *Worker) postpone(d Delivery, delay time.Duration, fields []zap.Field) error {
 	fields = append(fields, zap.Duration("retry_in", delay))
-	ctx, cancel := context.WithTimeout(context.Background(), queueOpTimeout)
-	defer cancel()
-	if err := w.queue.Postpone(ctx, d, time.Now().Add(delay)); err != nil {
+	if err := w.postponeDelivery(d, time.Now().Add(delay)); err != nil {
 		w.log.Error("jobs worker: postponing a job waiting on another run failed; it returns when its lease expires",
 			append(fields, zap.NamedError("release_error", err))...)
 		return err
@@ -518,6 +516,14 @@ func (w *Worker) release(d Delivery, at time.Time) error {
 	ctx, cancel := context.WithTimeout(context.Background(), queueOpTimeout)
 	defer cancel()
 	return w.queue.Release(ctx, d, at)
+}
+
+// postponeDelivery returns a delivery that did not start without consuming
+// the attempt counted by Reserve. It is also used for Once lock contention.
+func (w *Worker) postponeDelivery(d Delivery, at time.Time) error {
+	ctx, cancel := context.WithTimeout(context.Background(), queueOpTimeout)
+	defer cancel()
+	return w.queue.Postpone(ctx, d, at)
 }
 
 // shutdown waits for in-flight jobs up to ShutdownTimeout, then cancels them
