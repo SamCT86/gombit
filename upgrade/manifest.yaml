@@ -509,6 +509,19 @@ releases:
 
   - version: unreleased
     changes:
+      - id: worker-unstarted-shutdown-delivery-attempts
+        kind: informational
+        area: behavior
+        summary: "A worker stopping after Reserve but before running a job returns that delivery without spending a retry attempt."
+        details: |
+          If shutdown arrived while Reserve was in flight, the worker used
+          Release when the late delivery arrived, consuming an attempt although
+          its handler never started. Repeated restarts could exhaust a job's
+          MaxAttempts without running it. The worker now uses Queue.Postpone
+          for this case, preserving the attempt budget; jobs already executing
+          still follow the normal retry and shutdown semantics.
+        refs: [495]
+
       - id: date-driver-location
         kind: manual
         area: behavior
